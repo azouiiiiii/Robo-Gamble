@@ -1,86 +1,113 @@
+# detect.py
 import pyautogui
 import time
 from server.statemachine import GamePhase, AgentState
 
 class PokerDetector:
-    def __init__(self, sm):
+    def __init__(self, sm, config):
         self.sm = sm
-        # 配置区：请根据实际游戏窗口位置修改这些坐标
-        self.COORDS = {
-            "BTN_FOLD": (1000, 800),     # Fold 按钮中心坐标
-            "BTN_CALL": (1150, 800),     # Call 按钮中心坐标
-            "BTN_RAISE": (1300, 800),    # Raise 按钮中心坐标
-            "HAND_ZONE": (1150, 900),    # 手牌区域的一个检测点
-            "POT_ZONE": (800, 500)        # 底池区域的一个检测点
-        }
+        self.cfg = config
         
-        # 颜色配置：按钮亮起时的目标颜色 (R, G, B)
-        self.COLORS = {
-            "BTN_ACTIVE": (255, 255, 255), # 假设按钮亮起时包含纯白色
-            "CARD_BACK": (200, 0, 0)       # 手牌背面的颜色（用于判断是否有牌）
-        }
-
+        # 状态记录
         self.last_btn_visible = False
         self.phase_count = 0
+        
+        # 从 config 加载颜色和坐标（已自动缩放）
+        # 注意：此处仅存储路径，调用时再实时 get_coord 确保动态同步
+        self.trigger_pixel = "signals.call_btn_pixel"
+        self.hand_check_pixel = "regions.hand" # 取区域左上角或中心点
+        
+        # 获取颜色配置
+        self.active_color = self.cfg.get_color("call_active_rgb")
+        self.card_back_color = self.cfg.get_color("card_back_rgb")
 
     def is_button_present(self):
         """检测操作按钮（如 Call 键）是否亮起"""
-        x, y = self.COORDS["BTN_CALL"]
-        # pixelMatchesColor 允许一定的色差(tolerance)
-        return pyautogui.pixelMatchesColor(x, y, self.COLORS["BTN_ACTIVE"], tolerance=10)
+        x, y = self.cfg.get_coord(self.trigger_pixel)
+        # 使用 pixelMatchesColor 并在 Windows 下通过 Config 开启 DPI 感知
+        return pyautogui.pixelMatchesColor(x, y, self.active_color, tolerance=15)
 
     def has_hand_cards(self):
-        """检测当前是否有手牌（未弃牌且在局中）"""
-        x, y = self.COORDS["HAND_ZONE"]
-        return pyautogui.pixelMatchesColor(x, y, self.COLORS["CARD_BACK"], tolerance=10)
+        """
+        检测当前是否有手牌
+        优化：检测手牌区域中心点的颜色是否匹配背景/背牌色
+        """
+        region = self.cfg.get_coord("regions.hand")
+        # 取手牌区域的中心点进行像素检测
+        check_x = region[0] + region[2] // 2
+        check_y = region[1] + region[3] // 2
+        return pyautogui.pixelMatchesColor(check_x, check_y, self.card_back_color, tolerance=20)
 
     def detect_and_update(self):
-        """主检测循环逻辑"""
+        """主检测循环：同步 UI 状态到 Statemachine"""
         btn_now = self.is_button_present()
         cards_now = self.has_hand_cards()
-
-        # 情况 1：按钮从无到有 -> 进入新的下注轮
+        
+        # --- 逻辑 1：轮到我操作 (MY_TURN) ---
         if btn_now and not self.last_btn_visible:
+            # 按钮刚亮起，说明轮到我了
             self.phase_count += 1
-            self.update_phase_by_count()
-            self.sm.agent_state = AgentState.MY_TURN
-            print(f"--- 轮到操作 --- 阶段: {self.sm.current_phase.name}")
+            self.sync_game_phase() # 尝试同步阶段
+            
+            # 只有当不在处理动作中时，才切换状态
+            if self.sm.agent_state not in [AgentState.THINKING, AgentState.ACTING, AgentState.FOLDED]:
+                self.sm.agent_state = AgentState.MY_TURN
+                print(f"[DETECT] 轮到操作 | 阶段: {self.sm.current_phase.name} | 计数器: {self.phase_count}")
 
-        # 情况 2：按钮消失了
+        # --- 逻辑 2：动作结束/弃牌判定 ---
         elif not btn_now and self.last_btn_visible:
-            # 如果按钮消失时手牌也没了 -> 判定为 Fold 或 局结束
+            # 按钮消失了，判断是点掉了还是弃牌了
             if not cards_now:
                 self.sm.agent_state = AgentState.FOLDED
-                print("检测到手牌消失，进入 FOLDED/等待 状态")
+                print("[DETECT] 手牌消失，判定为 FOLDED")
             else:
                 self.sm.agent_state = AgentState.IDLE
-                print("按钮消失，进入换牌/等待他人操作状态")
+                print("[DETECT] 按钮消失，等待他人或下一轮")
 
-        # 情况 3：完全没牌了（结算阶段）
+        # --- 逻辑 3：全局重置 (结算判定) ---
+        # 如果检测到长时间没手牌且状态机不是 INIT，说明这局彻底结束了
         if not cards_now and self.sm.current_phase != GamePhase.INIT:
-            if self.sm.agent_state != AgentState.FOLDED:
-                print("本局结束，重置状态机")
-                self.sm.reset_hand()
-                self.phase_count = 0
+            # 这里可以增加一个延迟检测，防止动画闪烁导致的误判
+            print("[DETECT] 检测到牌局空档，重置状态机...")
+            self.sm.reset_hand()
+            self.phase_count = 0
 
         self.last_btn_visible = btn_now
 
-    def update_phase_by_count(self):
-        """根据按钮出现的次数切换物理阶段"""
-        phase_map = {
-            1: GamePhase.PRE_FLOP,
-            2: GamePhase.FLOP,
-            3: GamePhase.TURN,
-            4: GamePhase.RIVER
-        }
-        self.sm.current_phase = phase_map.get(self.phase_count, GamePhase.INIT)
+    def sync_game_phase(self):
+        """
+        同步游戏阶段：
+        双重验证：优先看 Statemachine 里的公共牌数量，如果为空则参考计数器。
+        """
+        # 如果 capture.py 已经识别到了公共牌，以牌数为准（更准）
+        pc_count = len(self.sm.data.get("public_cards", []))
+        
+        if pc_count > 0:
+            # 这里的逻辑在 statemachine.derive_phase 中已有体现
+            self.sm.derive_phase() 
+        else:
+            # 翻牌前(Pre-flop)阶段通常没有公共牌，依赖计数器
+            phase_map = {
+                1: GamePhase.PRE_FLOP,
+                2: GamePhase.FLOP,
+                3: GamePhase.TURN,
+                4: GamePhase.RIVER
+            }
+            self.sm.current_phase = phase_map.get(self.phase_count, GamePhase.INIT)
 
-# 简易测试代码
+# 调试用
 if __name__ == "__main__":
+    from utils.config_manager import Config
     from server.statemachine import PokerStateMachine
-    sm = PokerStateMachine()
-    detector = PokerDetector(sm)
     
-    while True:
-        detector.detect_and_update()
-        time.sleep(0.5)  # 操作时要另外拉长或添加全局开关，保证能操作完成
+    cfg = Config("config.json")
+    sm = PokerStateMachine()
+    det = PokerDetector(sm, cfg)
+    
+    print("哨兵模式已启动，正在扫描 UI...")
+    try:
+        while True:
+            det.detect_and_update()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("停止检测")
