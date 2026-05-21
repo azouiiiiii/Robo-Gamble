@@ -49,3 +49,36 @@ class GameMemory:
 
     def get_history(self):
         return self.history
+
+
+if __name__ == "__main__":
+    from enum import Enum
+
+    class FakePhase(Enum):
+        PRE_FLOP = 1
+        FLOP = 2
+        TURN = 3
+
+    mem = GameMemory()
+    # 空历史
+    assert "刚开始" in mem.get_semantic_history()
+    print("[PASS] empty history")
+
+    # 添加事件
+    mem.add_event({"phase": FakePhase.PRE_FLOP, "pot": 100, "action": "detect"})
+    mem.add_event({"phase": FakePhase.FLOP, "pot": 250, "action": "detect"})
+    sem = mem.get_semantic_history()
+    assert "激增" in sem or "100" in sem
+    print("[PASS] pot increase detected")
+
+    mem.add_event({"phase": FakePhase.TURN, "pot": 250, "action": "detect"})
+    sem = mem.get_semantic_history()
+    assert "平稳" in sem or "250" in sem
+    print("[PASS] pot stable detected")
+
+    # reset
+    mem.reset()
+    assert len(mem.history) == 0
+    print("[PASS] reset")
+
+    print("\n全部通过")
