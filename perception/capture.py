@@ -36,6 +36,7 @@ class CardCapturer:
         self.reg_pot = "regions.pot"
         self.reg_raise = "regions.raise_amount"
         self.reg_chips = "regions.my_chips"
+        self.reg_call = "regions.call_amount"
         self._counter = 0  # 调试用
 
     # ── 截图入口 ────────────────────────────────
@@ -48,13 +49,13 @@ class CardCapturer:
         screenshot = self.executor.hold_c_for_capture(_get_screenshot)
         self._counter += 1
         _save_debug(f"hand_raw_{self._counter}.png", screenshot)
-        return self._process_to_cards(screenshot, num_cards=2, tag=f"hand_{self._counter}")
+        return self._process_to_cards(screenshot, num_cards=2, tag=f"hand_{self._counter}", suit_prefix="hand_suit")
 
     def capture_public(self):
         region = self.cfg.get_coord(self.reg_public)
         screenshot = pyautogui.screenshot(region=region)
         _save_debug(f"public_raw_{self._counter}.png", screenshot)
-        return self._process_to_cards(screenshot, num_cards=5, tag=f"public_{self._counter}")
+        return self._process_to_cards(screenshot, num_cards=5, tag=f"public_{self._counter}", suit_prefix="public_suit")
 
     # ── 数字 OCR ──────────────────────────────
 
@@ -70,6 +71,11 @@ class CardCapturer:
 
     def capture_my_chips(self):
         region = self.cfg.get_coord(self.reg_chips)
+        img = pyautogui.screenshot(region=region)
+        return self._ocr_to_int(img)
+
+    def capture_call_amount(self):
+        region = self.cfg.get_coord(self.reg_call)
         img = pyautogui.screenshot(region=region)
         return self._ocr_to_int(img)
 
@@ -95,7 +101,7 @@ class CardCapturer:
 
     # ── 牌面识别 ──────────────────────────────
 
-    def _process_to_cards(self, pil_img, num_cards, tag=""):
+    def _process_to_cards(self, pil_img, num_cards, tag="", suit_prefix=""):
         if pil_img is None or num_cards == 0:
             return []
 
@@ -104,11 +110,20 @@ class CardCapturer:
         cards = []
 
         for i in range(num_cards):
+            # 花色：绝对像素点匹配
+            suit = self._get_suit_from_pixel(f"{suit_prefix}_{i+1}")
+
+            # 点数：裁剪左上角 OCR
             left = i * card_w
             margin = card_w // 10
             crop = pil_img.crop((left + margin, 0, min(left + card_w - margin, w), h))
+            rank_crop = crop.crop((0, 0, card_w // 2, h // 2))
             _save_debug(f"{tag}_slot{i}.png", crop)
-            cards.append(self._recognize_card(crop, tag=f"{tag}_slot{i}"))
+            _save_debug(f"{tag}_slot{i}_rank.png", rank_crop)
+            rank = self._ocr_rank(rank_crop)
+
+            result = f"{rank}{suit}" if rank else f"?{suit}"
+            cards.append(result)
 
         return cards
 
@@ -124,38 +139,11 @@ class CardCapturer:
                 count += 1
         return count
 
-    def _recognize_card(self, card_img, tag=""):
-        w, h = card_img.size
-        arr = np.array(card_img)
-
-        # ── 花色：取左上角 + 中心区域，分离背景干扰 ──
-        # 牌面主体通常在区域中央偏上
-        sample_regions = [
-            arr[h//8:h//3, w//8:w//3],       # 左上角花色区域
-            arr[h//4:h//2, w//4:w//2],       # 中央偏上
-        ]
-
-        all_pixels = []
-        for region in sample_regions:
-            if region.size > 0:
-                all_pixels.extend(region.reshape(-1, 3))
-
-        if not all_pixels:
-            return "??"
-
-        pixels = np.array(all_pixels)
-        avg_r = int(np.mean(pixels[:, 0]))
-        avg_g = int(np.mean(pixels[:, 1]))
-        avg_b = int(np.mean(pixels[:, 2]))
-        suit = self._match_suit(avg_r, avg_g, avg_b)
-
-        # ── 点数：放大 + 自适应二值化 ──
-        rank_crop = card_img.crop((0, 0, w // 2, h // 2))
-        _save_debug(f"{tag}_rank.png", rank_crop)
-        rank = self._ocr_rank(rank_crop)
-
-        result = f"{rank}{suit}" if rank else f"?{suit}"
-        return result
+    def _get_suit_from_pixel(self, signal_key):
+        """读取绝对坐标的像素，匹配最近花色"""
+        x, y = self.cfg.get_coord(f"signals.{signal_key}")
+        r, g, b = pyautogui.pixel(int(x), int(y))
+        return self._match_suit(r, g, b)
 
     def _match_suit(self, r, g, b):
         suits = {

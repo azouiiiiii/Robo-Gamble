@@ -28,14 +28,10 @@ TASKS = [
     # # --- 筹码区域 ---
     # {"label": "regions.my_chips",        "type": "box",   "state": "操作"},
 
-    # --- 五张公共牌位的中心点（用于判断该位置是否有牌）---
-    {"label": "signals.public_card_1",    "type": "point", "state": "操作"},
-    {"label": "signals.public_card_2",    "type": "point", "state": "操作"},
-    {"label": "signals.public_card_3",    "type": "point", "state": "操作"},
-    {"label": "signals.public_card_4",    "type": "point", "state": "操作"},
-    {"label": "signals.public_card_5",    "type": "point", "state": "操作"},
-    # --- 牌面亮色参考（之前取的 255,255,255）---
-    # {"label": "colors.card_face_rgb",     "type": "color", "state": "操作"},
+    # --- 重圈筹码区域（小一点，精准）---
+    {"label": "regions.my_chips",         "type": "box",   "state": "操作"},
+    # --- Call 金额显示区域（框选，悬停Call后出现数字=call，空=check）---
+    {"label": "regions.call_amount",      "type": "box",   "state": "操作"},
 ]
 
 images = {}

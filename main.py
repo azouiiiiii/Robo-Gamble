@@ -58,12 +58,17 @@ def main():
                 chips = capturer.capture_my_chips()
                 if chips > 0:
                     sm.data["my_chips"] = chips
-                log.info(f"底池={sm.data['pot']}  筹码={sm.data['my_chips']}")
+
+                # 悬停 Call 读取跟注金额（有数字=call，无=check）
+                executor.hover_call()
+                to_call = capturer.capture_call_amount()
+                log.info(f"底池={sm.data['pot']}  筹码={sm.data['my_chips']}  "
+                         f"跟注={to_call} ({'call' if to_call > 0 else 'check'})")
 
                 # 手牌评估
                 eval_data = evaluate_hand(sm.data["hand"], sm.data["public_cards"])
                 preflop = preflop_hand_strength(sm.data["hand"])
-                odds_ratio, odds_pct = pot_odds_analysis(sm.data["pot"], 0)
+                odds_ratio, odds_pct = pot_odds_analysis(sm.data["pot"], to_call)
 
                 log.info(f"成牌={eval_data['made_hand']}  "
                          f"听牌={eval_data['draws'] or '无'}  "
@@ -87,6 +92,7 @@ def main():
                     "public_cards": sm.data["public_cards"],
                     "pot": sm.data["pot"],
                     "my_chips": sm.data["my_chips"],
+                    "to_call": to_call,
                     "hand_strength": preflop[0],
                     "made_hand": eval_data["made_hand"],
                     "draws": eval_data["draws"],

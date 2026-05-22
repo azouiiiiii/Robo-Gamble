@@ -49,7 +49,7 @@ class PokerExecutor:
 
     def _do_raise(self, target, read_raise_amount):
         """
-        悬停 raise 按钮 → 滚轮调金额 → OCR 逼近目标 → 点击确认
+        悬停 raise → 键盘上下键调金额 → OCR 逼近目标 → 点击确认
         """
         if read_raise_amount is None:
             print("[EXECUTOR] 无法读取 raise 金额，直接点击 raise")
@@ -68,47 +68,55 @@ class PokerExecutor:
             self._click("buttons.raise")
             return
 
-        # 3. 校准：滚 3 格，算每格步长
-        calibrate_ticks = 3
-        direction = 1 if target > current else -1
-        pyautogui.scroll(direction * calibrate_ticks)
+        # 3. 校准：按 3 次键，算每次步长
+        calibrate_presses = 3
+        direction = 'up' if target > current else 'down'
+        for _ in range(calibrate_presses):
+            pyautogui.press(direction)
+            time.sleep(0.05)
         time.sleep(0.3)
         new_val = read_raise_amount()
 
-        step = abs(new_val - current) / calibrate_ticks
-        print(f"[EXECUTOR] 校准: {current} → {new_val}, 每格={step:.0f}")
+        step = abs(new_val - current) / calibrate_presses
+        print(f"[EXECUTOR] 校准: {current} → {new_val}, 每次={step:.0f}")
 
         if step == 0:
             self._click("buttons.raise")
             return
 
-        # 4. 滚到目标
+        # 4. 按到目标
         remaining = target - new_val
-        ticks = int(abs(remaining) / step)
-        dir_sign = 1 if remaining > 0 else -1
+        presses = int(abs(remaining) / step)
+        dir_key = 'up' if remaining > 0 else 'down'
 
-        print(f"[EXECUTOR] 剩余差值: {remaining}, 滚动 {ticks} 格")
-        # 分批滚，避免一次太多
+        print(f"[EXECUTOR] 剩余差值: {remaining}, 按键 {presses} 次")
         batch = 20
-        while ticks > 0:
-            n = min(ticks, batch)
-            pyautogui.scroll(dir_sign * n)
-            ticks -= n
-            time.sleep(0.1)
+        while presses > 0:
+            n = min(presses, batch)
+            for _ in range(n):
+                pyautogui.press(dir_key)
+                time.sleep(0.03)
+            presses -= n
 
         # 5. 微调
         time.sleep(0.25)
         final_val = read_raise_amount()
         diff = target - final_val
         if abs(diff) > step * 0.5:
-            pyautogui.scroll(int(diff / step))
-            time.sleep(0.15)
+            adj_key = 'up' if diff > 0 else 'down'
+            for _ in range(int(abs(diff) / step)):
+                pyautogui.press(adj_key)
+                time.sleep(0.03)
 
         # 6. 点击确认
         time.sleep(0.2)
         final_val = read_raise_amount()
         print(f"[EXECUTOR] 调整完成: {final_val} → 点击确认")
         self._click("buttons.raise")
+
+    def hover_call(self):
+        """悬停 Call 按钮以显示 call/check 金额"""
+        self._hover("buttons.call")
 
     def hold_c_for_capture(self, capture_callback):
         print("[EXECUTOR] 按住 C 键...")

@@ -11,6 +11,7 @@ def build_poker_prompt(data, semantic_history):
     outs_detail = data.get("outs_detail", "")
     odds = data.get("pot_odds", "")
     equity = data.get("required_equity", 0)
+    to_call = data.get("to_call", 0)
 
     prompt = f"""
 你是一位顶级的德州扑克策略专家。
@@ -24,6 +25,7 @@ def build_poker_prompt(data, semantic_history):
 - 公共牌: {public_str}
 - 底池: {data['pot']}
 - 我的筹码: {data['my_chips']}
+- 跟注需支付: {to_call} ({'check' if to_call == 0 else 'call'})
 
 ### 3. 本地手牌评估 (确定数据，直接使用):
 - 起手牌评级: {hand_eval}

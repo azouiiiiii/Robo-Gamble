@@ -93,7 +93,9 @@ class PokerDetector:
         count = self.capturer.count_public_cards()
         phase_map = {0: GamePhase.PRE_FLOP, 3: GamePhase.FLOP,
                      4: GamePhase.TURN, 5: GamePhase.RIVER}
-        self.sm.current_phase = phase_map.get(count, GamePhase.PRE_FLOP)
+        if count in phase_map:
+            self.sm.current_phase = phase_map[count]
+        # counts 1, 2 是翻牌中间态，保持当前阶段不变
 
 
 if __name__ == "__main__":
