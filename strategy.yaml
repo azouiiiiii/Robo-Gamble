@@ -1,41 +1,79 @@
-# 德州扑克 AI 硬性决策约束 — 基于数值阈值的底线规则
-# 以下数据由 evaluator.py 提供：
-#   hand_score: 起手牌分数 0~10
-#   made_hand: 当前成牌类型
-#   outs: 听牌张数
-#   required_equity: 跟注所需最低胜率%
-#   to_call: 跟注金额 (0 = check)
+# 德州扑克 AI 硬性决策约束
 
 preflop:
-  # 条件: 手牌分数 >= min_score 且 所需胜率 <= max_equity → 不得 fold
-  rules:
-    - min_score: 8
-      max_equity: 60    # 超强牌，对手 all-in 也要跟
-      desc: "AA/KK/AKs 级别，几乎从不弃牌"
-    - min_score: 6
-      max_equity: 35    # 中对子/AT+ 级别，赔率合理就继续
-      desc: "中对子、好高张，正常赔率跟注"
-    - min_score: 4
-      max_equity: 20    # 小对子/同花连牌，便宜看翻牌
-      desc: "投机牌，极便宜才跟"
 
-  # check (to_call=0) 时永不 fold
   no_fold_on_check: true
 
-postflop:
-  # outs 估算胜率 ≈ outs * 2 (河牌) / outs * 4 (转牌)
-  # 如果 outs_equity > required_equity → 必须继续
-  draw_by_equity:
-    min_outs: 4         # 至少 4 outs 才算听牌
-    turn_multiplier: 4  # 转牌圈 outs → 胜率%
-    river_multiplier: 2 # 河牌圈 outs → 胜率%
+  # 强牌：禁止弃牌
+  hard_continue_rules:
+    - min_score: 8
+      max_equity: 100
+      action: call_or_raise
+      desc: "AA/KK/QQ/AKs，几乎永不弃牌"
 
-  # 已成牌保护：牌力至少 min_made 时，不得对 check 弃牌
+    - min_score: 6
+      max_equity: 45
+      action: call_or_raise
+      desc: "中对子、AJ+/KQ，赔率合理必须继续"
+
+    - min_score: 4
+      max_equity: 25
+      action: call
+      desc: "小对子/投机牌，便宜入池"
+
+  # 新增：避免过度弃牌
+  playable_hand_overrides:
+
+    suited_ace:
+      enabled: true
+      min_rank: 2
+      action_if_reasonable_price: call_or_raise
+      max_equity: 35
+
+    suited_broadway:
+      enabled: true
+      action_if_reasonable_price: call_or_raise
+      max_equity: 35
+
+    suited_connector:
+      enabled: true
+      min_gap: 0
+      max_gap: 1
+      action_if_reasonable_price: call
+      max_equity: 25
+
+    offsuit_broadway:
+      enabled: true
+      examples:
+        - ATo
+        - KQo
+        - QJo
+      action_if_reasonable_price: call
+      max_equity: 28
+
+  uncertainty_policy:
+    prefer_call_over_fold_when_playable: true
+    do_not_require_dominating_equity_preflop: true
+    avoid_overfolding: true
+
+
+postflop:
+
+  draw_by_equity:
+    min_outs: 4
+    turn_multiplier: 4
+    river_multiplier: 2
+
   made_hand_protect:
     min_made: "一对"
-    vs_check: "call"    # 免费看牌至少 call/check
+    vs_check: "check"
+
+  semi_bluff:
+    min_outs: 8
+    allow_raise: true
 
 general:
+
   raise:
     pot_fraction_min: 0.5
     pot_fraction_max: 1.2
