@@ -68,7 +68,7 @@ class PokerDetector:
 
         # ── 3. 结算检测（冷却 20 帧后才开始查）──
         if not btn_now and self.sm.current_phase != GamePhase.INIT:
-            if self.idle_frames >= 20:
+            if self.idle_frames >= 7:
                 if self.is_settlement():
                     self.settlement_count += 1
                     if self.settlement_count >= 3:

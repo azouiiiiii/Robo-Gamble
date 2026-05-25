@@ -5,33 +5,22 @@ import os
 SCREENSHOTS = {
     "2": {"file": "action.png",     "label": "操作"},
     "3": {"file": "settlement.png", "label": "结算"},
+    "4": {"file": "peek.png",       "label": "看牌"},
 }
 
 TASKS = [
-    # # --- 操作截图：坐标 ---
-    # {"label": "buttons.fold",            "type": "point", "state": "操作"},
-    # {"label": "buttons.call",            "type": "point", "state": "操作"},
-    # {"label": "buttons.raise",           "type": "point", "state": "操作"},
-    # {"label": "signals.call_btn_pixel",  "type": "point", "state": "操作"},
-    # {"label": "regions.hand",            "type": "box",   "state": "操作"},
-    # {"label": "regions.public",          "type": "box",   "state": "操作"},
-    # {"label": "regions.pot",             "type": "box",   "state": "操作"},
-    # {"label": "regions.raise_amount",    "type": "box",   "state": "操作"},
-    # {"label": "regions.round_winner",    "type": "box",   "state": "结算"},
-
-    # # --- 取色 ---
-    # {"label": "colors.heart",            "type": "color", "state": "操作"},
-    # {"label": "colors.diamond",          "type": "color", "state": "操作"},
-    # {"label": "colors.spade",            "type": "color", "state": "操作"},
-    # {"label": "colors.club",             "type": "color", "state": "操作"},
-
-    # # --- 筹码区域 ---
-    # {"label": "regions.my_chips",        "type": "box",   "state": "操作"},
-
-    # --- 重圈筹码区域（小一点，精准）---
-    {"label": "regions.my_chips",         "type": "box",   "state": "操作"},
-    # --- Call 金额显示区域（框选，悬停Call后出现数字=call，空=check）---
-    {"label": "regions.call_amount",      "type": "box",   "state": "操作"},
+    # # --- 点数精确框选（已完成）---
+    # {"label": "regions.hand_rank_1",     "type": "box", "state": "看牌"},
+    # {"label": "regions.hand_rank_2",     "type": "box", "state": "看牌"},
+    # {"label": "regions.public_rank_1",   "type": "box", "state": "操作"},
+    # {"label": "regions.public_rank_2",   "type": "box", "state": "操作"},
+    # {"label": "regions.public_rank_3",   "type": "box", "state": "操作"},
+    # {"label": "regions.public_rank_4",   "type": "box", "state": "操作"},
+    # {"label": "regions.public_rank_5",   "type": "box", "state": "操作"},
+    # --- 筹码区域重框 ---
+    {"label": "regions.my_chips",        "type": "box", "state": "操作"},
+    {"label": "regions.call_amount",     "type": "box", "state": "操作"},
+    # {"label": "regions.pot",             "type": "box", "state": "操作"},
 ]
 
 images = {}
@@ -60,6 +49,16 @@ def find_state_key(label):
             return k
     return None
 
+# 检查任务所需截图是否齐全
+missing = set()
+for t in TASKS:
+    key = find_state_key(t["state"])
+    if key and key not in images:
+        missing.add(t["state"])
+if missing:
+    print(f"\n⚠ 缺少截图，以下状态的图片未找到: {missing}")
+    print("  请补上对应截图后重新运行")
+
 def switch_to_task(idx):
     global current_state
     if idx >= len(TASKS):
@@ -69,11 +68,14 @@ def switch_to_task(idx):
     if key and key in images:
         current_state = key
 
-current_state = find_state_key(TASKS[0]["state"]) or list(images.keys())[0]
+current_state = find_state_key(TASKS[0]["state"])
+if current_state not in images:
+    current_state = list(images.keys())[0]
 
 def draw_ui(img):
     out = img.copy()
     h, w = out.shape[:2]
+
 
     # ── 顶部状态栏 ──
     overlay = out.copy()
@@ -168,13 +170,12 @@ def on_mouse(event, x, y, flags, param):
 cv2.namedWindow("get_coords", cv2.WINDOW_NORMAL)
 cv2.setMouseCallback("get_coords", on_mouse)
 
-print(f"\n一共 {len(TASKS)} 个取色任务：")
+print(f"\n一共 {len(TASKS)} 个框选任务：")
 for i, t in enumerate(TASKS):
-    print(f"  {i+1}. 🎨 {t['label']} ({t['state']})")
-print("\n操作: 鼠标悬停看RGB | 点击记录 | Z=回退 | Q=退出")
-print("(坐标取点/框选已注释，需要时取消注释即可)")
-print(f"\n>>> 当前: {TASKS[0]['label']} <<<")
-print("   请在截图中找到红心花色，点击取色")
+    print(f"  {i+1}. [{t['state']}] {t['label']}")
+print("\n操作: 鼠标悬停看RGB | 点两下框选区域 | Z=回退 | Q=退出")
+print("注意: 前2个任务需要 peek.png (按住C键看手牌的截图)")
+print(f"\n>>> 当前: {TASKS[0]['label']} @ {TASKS[0]['state']} <<<")
 
 while True:
     frame = draw_ui(images[current_state])
@@ -204,15 +205,13 @@ cv2.destroyAllWindows()
 
 # 输出汇总
 print("\n" + "=" * 60)
-print("取色结果（填入 config.json colors 段）")
+print("框选结果（填入 config.json → coords → regions）")
 print("=" * 60)
 
 for task in TASKS:
     label = task["label"]
     val = results.get(label)
-    if val and task["type"] == "color":
-        print(f'  "{label.split(".")[-1]}_rgb": [{val[0]}, {val[1]}, {val[2]}],')
-    elif val:
-        print(f"  {label:35s} = {val}")
+    if val:
+        print(f'  "{label}": {val},')
     else:
-        print(f"  {label:35s} ✗ 未获取")
+        print(f'  "{label}": ✗ 未获取')

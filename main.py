@@ -94,6 +94,7 @@ def main():
                     "my_chips": sm.data["my_chips"],
                     "to_call": to_call,
                     "hand_strength": preflop[0],
+                    "hand_score": preflop[1],
                     "made_hand": eval_data["made_hand"],
                     "draws": eval_data["draws"],
                     "outs": eval_data["outs"],
