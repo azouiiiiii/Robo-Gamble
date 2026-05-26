@@ -203,19 +203,209 @@ def _has_straight(ranks):
 
 
 def _count_straight_outs(ranks):
+    """遍历所有可能的顺子组合，统计需要多少 outs"""
+    uniq = set(ranks)
+    total_outs = 0
+
+    # 所有可能的顺子：2-3-4-5-6 到 10-J-Q-K-A，加上 A-2-3-4-5
+    straights = []
+    for low in range(2, 11):
+        straights.append({low, low + 1, low + 2, low + 3, low + 4})
+    straights.append({14, 2, 3, 4, 5})  # wheel
+
+    for straight in straights:
+        have = len(straight & uniq)
+        if have == 4:
+            total_outs += 4  # 差一张，4 个 outs
+
+    return min(total_outs, 25)
+
+
+def analyze_board_texture(public_cards):
+    """返回牌面客观事实，不做主观判断"""
+    if not public_cards:
+        return {"paired": False, "suited_count": 0, "connected_gaps": 0,
+                "high_cards": 0, "board_ranks": []}
+
+    cards = [parse_card(c) for c in public_cards if parse_card(c)]
+    if not cards:
+        return {"paired": False, "suited_count": 0, "connected_gaps": 0,
+                "high_cards": 0, "board_ranks": []}
+
+    ranks = [c[0] for c in cards]
+    suits = [c[1] for c in cards]
+
+    # 对子
+    paired = len(ranks) != len(set(ranks))
+    pair_rank = None
+    if paired:
+        for r, cnt in {r: ranks.count(r) for r in ranks}.items():
+            if cnt >= 2:
+                pair_rank = r
+                break
+
+    # 同色
+    suit_counts = {}
+    for s in suits:
+        suit_counts[s] = suit_counts.get(s, 0) + 1
+    suited_count = max(suit_counts.values())
+    dominant_suit = max(suit_counts, key=suit_counts.get) if suit_counts else None
+
+    # 连接度
     uniq = sorted(set(ranks))
-    max_outs = 0
-    for i in range(len(uniq)):
-        window = set(uniq[i:i + 5])
-        if len(window) >= 4:
-            # 差一张成顺
-            needed = 5 - len(window)
-            if needed == 1:
-                # 检查缺口能不能补
-                start, end = min(window), max(window)
-                if end - start <= 4:
-                    max_outs = max(max_outs, 4)
-    return max_outs
+    gaps = sum(1 for i in range(len(uniq) - 1) if uniq[i + 1] - uniq[i] <= 2)
+
+    # 高牌 T+
+    high_cards = sum(1 for r in ranks if r >= 10)
+
+    return {
+        "paired": paired,
+        "pair_rank": pair_rank,
+        "suited_count": suited_count,
+        "dominant_suit": dominant_suit,
+        "connected_gaps": gaps,
+        "high_cards": high_cards,
+        "board_ranks": sorted(ranks, reverse=True)
+    }
+
+
+_RANK_NAME = {14: "A", 13: "K", 12: "Q", 11: "J", 10: "T",
+               9: "9", 8: "8", 7: "7", 6: "6", 5: "5", 4: "4", 3: "3", 2: "2"}
+
+
+def hand_strength_facts(hand, public_cards):
+    """
+    返回手牌质量的客观事实，不包含任何主观判断或策略标签。
+    所有判断性逻辑由 YAML 定义。
+    """
+    if not hand or len(hand) < 2:
+        return {"exists": False}
+
+    ev = evaluate_hand(hand, public_cards)
+    my_cards = [c for c in hand if parse_card(c)]
+    my_parsed = [parse_card(c) for c in my_cards]
+    all_parsed = [parse_card(c) for c in hand + public_cards if parse_card(c)]
+    ranks = [c[0] for c in all_parsed]
+    suits = [c[1] for c in all_parsed]
+
+    rank_counts = {}
+    for r in ranks:
+        rank_counts[r] = rank_counts.get(r, 0) + 1
+
+    suit_counts = {}
+    for s in suits:
+        suit_counts[s] = suit_counts.get(s, 0) + 1
+
+    uniq = sorted(set(ranks))
+
+    facts = {
+        "exists": True,
+        "made_hand": ev["made_hand"],
+        "draws": ev["draws"],
+        "outs": ev["outs"],
+        "outs_detail": ev["outs_detail"],
+        "my_ranks": sorted([c[0] for c in my_parsed], reverse=True),
+        "my_rank_names": [_RANK_NAME.get(r, str(r)) for r in sorted([c[0] for c in my_parsed], reverse=True)],
+    }
+
+    made = ev["made_hand"]
+
+    if made == "同花顺":
+        facts["hand_detail"] = "同花顺"
+
+    elif made == "四条":
+        quad_r = max((r for r, c in rank_counts.items() if c >= 4), default=0)
+        facts["quads_rank"] = quad_r
+        facts["quads_rank_name"] = _RANK_NAME.get(quad_r, str(quad_r))
+
+    elif made == "葫芦":
+        trips_r = max((r for r, c in rank_counts.items() if c >= 3), default=0)
+        pair_r = max((r for r, c in rank_counts.items() if c >= 2 and r != trips_r), default=0)
+        facts["trips_rank"] = trips_r
+        facts["trips_rank_name"] = _RANK_NAME.get(trips_r, str(trips_r))
+        facts["pair_rank"] = pair_r
+        facts["pair_rank_name"] = _RANK_NAME.get(pair_r, str(pair_r))
+        # 比我大的葫芦有多少种
+        better = sum(1 for r in set(ranks) if r > trips_r and rank_counts.get(r, 0) >= 2)
+        facts["better_boats_possible"] = better
+
+    elif made == "同花":
+        flush_suit = max(suit_counts, key=suit_counts.get)
+        my_flush_cards = [c for c in my_parsed if c[1] == flush_suit]
+        flush_ranks = sorted([c[0] for c in all_parsed if c[1] == flush_suit], reverse=True)
+        my_high = max((c[0] for c in my_flush_cards), default=0)
+        facts["flush_high_rank"] = my_high
+        facts["flush_high_name"] = _RANK_NAME.get(my_high, str(my_high))
+        # 坚果同花? (我有没有该花色的A)
+        facts["has_nut_flush"] = any(c[0] == 14 and c[1] == flush_suit for c in my_parsed)
+        # 比我大的同花有多少种 (board 上有多少张该花色比我大)
+        higher_flush_boards = [r for r in flush_ranks if r > my_high]
+        facts["better_flush_cards_on_board"] = len(higher_flush_boards)
+
+    elif made == "顺子":
+        top = 0
+        for i in range(len(uniq) - 4):
+            if uniq[i + 4] - uniq[i] == 4:
+                top = max(top, uniq[i + 4])
+        if {14, 2, 3, 4, 5}.issubset(set(uniq)):
+            top = max(top, 5)
+        facts["straight_top"] = top
+        facts["straight_top_name"] = _RANK_NAME.get(top, str(top))
+        # 比我大的顺子: 任何顺子顶 > top
+        better = 0
+        for i in range(len(uniq) - 4):
+            if uniq[i + 4] - uniq[i] == 4 and uniq[i + 4] > top:
+                better += 1
+        facts["better_straights_possible"] = better
+
+    elif made == "三条":
+        trips_r = max((r for r, c in rank_counts.items() if c >= 3))
+        facts["trips_rank"] = trips_r
+        facts["trips_rank_name"] = _RANK_NAME.get(trips_r, str(trips_r))
+        my_kickers = sorted([r for r in ranks if r != trips_r], reverse=True)[:2]
+        facts["kickers"] = my_kickers
+        facts["kicker_names"] = [_RANK_NAME.get(r, str(r)) for r in my_kickers]
+        better = sum(1 for r in set(ranks) if r > trips_r and rank_counts.get(r, 0) >= 2)
+        facts["better_trips_possible"] = better
+
+    elif made == "两对":
+        pair_ranks = sorted([r for r, c in rank_counts.items() if c >= 2], reverse=True)
+        facts["top_pair_rank"] = pair_ranks[0] if len(pair_ranks) > 0 else 0
+        facts["top_pair_name"] = _RANK_NAME.get(pair_ranks[0], "?") if len(pair_ranks) > 0 else "?"
+        facts["bottom_pair_rank"] = pair_ranks[1] if len(pair_ranks) > 1 else 0
+        facts["bottom_pair_name"] = _RANK_NAME.get(pair_ranks[1], "?") if len(pair_ranks) > 1 else "?"
+        # 更大的两对有多少
+        better = sum(1 for r in set(ranks) if r > pair_ranks[0] and rank_counts.get(r, 0) >= 2) if pair_ranks else 0
+        facts["better_two_pairs_possible"] = better
+
+    elif made == "一对":
+        pair_r = max((r for r, c in rank_counts.items() if c >= 2))
+        facts["pair_rank"] = pair_r
+        facts["pair_rank_name"] = _RANK_NAME.get(pair_r, str(pair_r))
+        my_kickers = sorted([r for r in facts["my_ranks"] if r != pair_r], reverse=True)
+        facts["kicker"] = my_kickers[0] if my_kickers else 0
+        facts["kicker_name"] = _RANK_NAME.get(my_kickers[0], "?") if my_kickers else "?"
+        # 超对?
+        pub_ranks = [parse_card(c)[0] for c in public_cards if parse_card(c)]
+        facts["is_overpair"] = all(r < pair_r for r in pub_ranks) if pub_ranks else True
+        # 顶对?
+        facts["is_top_pair"] = pair_r == max(pub_ranks) if pub_ranks else False
+        # 更大的对子数量
+        facts["better_pairs_on_board"] = sum(1 for r in set(pub_ranks) if r > pair_r) if pub_ranks else 0
+
+    else:  # 高牌
+        facts["high_card_rank"] = facts["my_ranks"][0]
+        facts["high_card_name"] = facts["my_rank_names"][0]
+        # 听牌细节
+        if "同花听牌" in ev["draws"]:
+            fd_suit = max(suit_counts, key=suit_counts.get)
+            facts["is_nut_flush_draw"] = any(c[0] == 14 and c[1] == fd_suit for c in my_parsed)
+        # 两张超张? (手牌都比公牌大)
+        pub_ranks = [parse_card(c)[0] for c in public_cards if parse_card(c)]
+        if pub_ranks:
+            facts["both_overcards"] = all(r > max(pub_ranks) for r in facts["my_ranks"])
+
+    return facts
 
 
 if __name__ == "__main__":
@@ -244,6 +434,39 @@ if __name__ == "__main__":
     ratio, pct = pot_odds_analysis(1000, 500)
     assert pct == 33.3
     print(f"[PASS] pot_odds: 底池1000 跟注500 → 需{pct}%胜率")
+
+    # ── board texture ──
+    t = analyze_board_texture([])
+    assert t["paired"] is False and t["board_ranks"] == []
+    # K72r → 彩虹干燥
+    t = analyze_board_texture(["Kh", "7d", "2c"])
+    assert not t["paired"] and t["connected_gaps"] == 0
+    # 88K → 对子面
+    t = analyze_board_texture(["8s", "8h", "Kd"])
+    assert t["paired"] and t["pair_rank"] == 8
+    # 三张红桃
+    t = analyze_board_texture(["Ah", "Kh", "3h"])
+    assert t["suited_count"] == 3
+    # 连接面
+    t = analyze_board_texture(["Jd", "Ts", "9h"])
+    assert t["connected_gaps"] >= 2
+    print("[PASS] board_texture 客观事实")
+
+    # ── hand_strength_facts ──
+    f = hand_strength_facts(["Ah", "Kh"], ["Qh", "Jh", "Th"])
+    assert f["made_hand"] == "同花顺"
+    f = hand_strength_facts(["Ah", "5h"], ["Kh", "Qh", "Jh"])
+    assert f["has_nut_flush"] is True
+    f = hand_strength_facts(["Ah", "Ad"], ["Kd", "7s", "2c"])
+    assert f["is_overpair"] is True and f["pair_rank_name"] == "A"
+    f = hand_strength_facts(["Ah", "Kh"], ["Qh", "Jh", "2d"])
+    assert "同花听牌" in f["draws"] and f["exists"]
+    f = hand_strength_facts(["7h", "2d"], ["Kd", "Qs", "Jh"])
+    assert f["made_hand"] == "高牌"
+    # 葫芦
+    f = hand_strength_facts(["Ah", "Ad"], ["Ac", "Kd", "Ks"])
+    assert f["trips_rank_name"] == "A"
+    print(f"[PASS] hand_strength_facts: 同花顺 | 坚果同花 | 超对A | 高牌 | 葫芦A")
 
     # edge cases
     assert parse_card("??") is None or parse_card("??")[0] == 0

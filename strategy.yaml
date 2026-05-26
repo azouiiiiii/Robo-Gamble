@@ -4,6 +4,10 @@ preflop:
 
   no_fold_on_check: true
 
+  # 翻前底池为0时底池赔率失效(to_call/0=100%)，自动改用筹码占比
+  equity_override:
+    when_pot_zero: "stack_pct"  # stack_pct = to_call/(筹码+to_call)*100，能合理区分便宜/贵
+
   # 强牌：禁止弃牌
   hard_continue_rules:
     - min_score: 8
@@ -20,6 +24,11 @@ preflop:
       max_equity: 25
       action: call
       desc: "小对子/投机牌，便宜入池"
+
+    - min_score: 2
+      max_equity: 5
+      action: call
+      desc: "带高张或同花的极边缘牌，成本极低必须看翻牌"
 
   # 新增：避免过度弃牌
   playable_hand_overrides:
@@ -71,6 +80,39 @@ postflop:
   semi_bluff:
     min_outs: 8
     allow_raise: true
+
+  # ── 牌面纹理描述模板 ──
+  board_labels:
+    paired: "公牌有对子({rank})，须警惕三条/葫芦"
+    monotone: "{count}张{suit}同花，同花威胁活跃"
+    connected: "顺子听面活跃，连接度高"
+    dry: "牌面很干，成牌价值可靠"
+    default: "普通牌面"
+
+  # ── 手牌描述模板 (纯事实填空，不做强弱判断) ──
+  hand_labels:
+    straight_flush: "同花顺"
+    quads: "四条{rank}"
+    boat: "{trips}葫芦(比你大的葫芦还有{better}种)"
+    flush: "{high}同花(比你大的同花有{better}种)"
+    nut_flush: "坚果同花(最大)"
+    straight: "{top}顺(比你大的顺子还有{better}种)"
+    trips: "三条{rank}(比你大的三条还有{better}种)"
+    two_pair: "{top}{bottom}两对(比你大的两对还有{better}种)"
+    overpair: "超对{rank}(所有公牌都比{rank}小)"
+    top_pair: "顶对{rank}, 踢脚{kicker}(对子是公牌中最大的)"
+    middle_pair: "中对{rank}(公牌有{better}张牌比{rank}大)"
+    bottom_pair: "底对{rank}(公牌有{better}张牌比{rank}大)"
+    high_card_a: "A高, 无对无听牌"
+    high_card_k: "K高"
+    combo_draw: "花顺双抽({outs}outs)"
+    nut_fd: "坚果同花听牌({outs}outs)"
+    fd_overs: "同花听牌+高张({outs}outs)"
+    fd: "同花听牌({outs}outs)"
+    oesd_overs: "两头顺听牌+高张({outs}outs)"
+    oesd: "两头顺听牌({outs}outs)"
+    gutshot: "卡顺听牌({outs}outs)"
+    air: "空气牌(无对无听牌)"
 
 general:
 

@@ -18,7 +18,7 @@ TASKS = [
     # {"label": "regions.public_rank_4",   "type": "box", "state": "操作"},
     # {"label": "regions.public_rank_5",   "type": "box", "state": "操作"},
     # --- 筹码区域重框 ---
-    {"label": "regions.my_chips",        "type": "box", "state": "操作"},
+    # {"label": "regions.my_chips",        "type": "box", "state": "操作"},
     {"label": "regions.call_amount",     "type": "box", "state": "操作"},
     # {"label": "regions.pot",             "type": "box", "state": "操作"},
 ]

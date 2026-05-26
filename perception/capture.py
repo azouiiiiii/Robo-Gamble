@@ -6,9 +6,6 @@ import easyocr
 from PIL import Image
 
 _reader = None
-_debug = True  # 设为 False 关闭调试截图
-_debug_dir = "debug"
-
 
 def _get_reader():
     global _reader
@@ -16,16 +13,6 @@ def _get_reader():
         
         _reader = easyocr.Reader(['en'], gpu=False, verbose=False)
     return _reader
-
-
-def _save_debug(name, img):
-    if not _debug:
-        return
-    os.makedirs(_debug_dir, exist_ok=True)
-    if isinstance(img, Image.Image):
-        img.save(os.path.join(_debug_dir, name))
-    else:
-        Image.fromarray(img).save(os.path.join(_debug_dir, name))
 
 
 class CardCapturer:
@@ -38,12 +25,16 @@ class CardCapturer:
         self.reg_raise = "regions.raise_amount"
         self.reg_chips = "regions.my_chips"
         self.reg_call = "regions.call_amount"
-        self._counter = 0  # 调试用
 
         # 加载筹码图标模板（用于从数字区域中抹除图标）
         self._icon_tmpl = None
         if os.path.exists("icon.png"):
             self._icon_tmpl = cv2.imread("icon.png", 0)
+
+        # call 区域图标通常更大更清晰，用独立模板
+        self._icon_call_tmpl = None
+        if os.path.exists("icon_call.png"):
+            self._icon_call_tmpl = cv2.imread("icon_call.png", 0)
 
         # 加载点数模板
         self._rank_templates = {}
@@ -65,24 +56,18 @@ class CardCapturer:
     def capture_hand(self):
         region = self.cfg.get_coord(self.reg_hand)
         screenshot = self.executor.hold_c_for_capture(lambda: pyautogui.screenshot(region=region))
-        self._counter += 1
-        _save_debug(f"hand_raw_{self._counter}.png", screenshot)
         return self._process_to_cards(screenshot, card_region=region, num_cards=2,
-                                      tag=f"hand_{self._counter}", suit_prefix="hand_suit")
+                                      suit_prefix="hand_suit")
 
     def capture_public(self):
         visible = self.count_public_cards()
         if visible == 0:
-            self._counter += 1
             return []
         region = self.cfg.get_coord(self.reg_public)
         screenshot = pyautogui.screenshot(region=region)
-        self._counter += 1
-        _save_debug(f"public_raw_{self._counter}.png", screenshot)
         active = set(range(visible))
         return self._process_to_cards(screenshot, card_region=region, num_cards=5,
-                                      tag=f"public_{self._counter}", suit_prefix="public_suit",
-                                      active_slots=active)
+                                      suit_prefix="public_suit", active_slots=active)
 
     # ── 数字 OCR ──────────────────────────────
 
@@ -90,6 +75,7 @@ class CardCapturer:
         region = self.cfg.get_coord(self.reg_pot)
         img = pyautogui.screenshot(region=region)
         img = self._remove_icon(img)
+        self._debug_save(img, "pot")
         return self._ocr_to_int(img)
 
     def capture_raise_amount(self):
@@ -102,37 +88,43 @@ class CardCapturer:
         region = self.cfg.get_coord(self.reg_chips)
         img = pyautogui.screenshot(region=region)
         img = self._remove_icon(img)
+        self._debug_save(img, "chips")
         return self._ocr_to_int(img)
+
+    def _debug_save(self, img, tag):
+        import time
+        _dir = "debug"
+        os.makedirs(_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        img.save(os.path.join(_dir, f"{tag}_{ts}.png"))
 
     def capture_call_amount(self):
         region = self.cfg.get_coord(self.reg_call)
         img = pyautogui.screenshot(region=region)
-        img = self._remove_icon(img)
+        img = self._remove_icon(img, tmpl=self._icon_call_tmpl)
         return self._ocr_to_int(img)
 
-    def _remove_icon(self, pil_img):
-        """抹除左侧筹码图标：模板匹配定位 → 失败则按图标宽度固定裁切"""
-        if self._icon_tmpl is None:
+    def _remove_icon(self, pil_img, tmpl=None):
+        """抹除左侧筹码图标：模板匹配定位 → 失败则抹黑"""
+        if tmpl is None:
+            tmpl = self._icon_tmpl
+        if tmpl is None:
             return pil_img
 
         gray = np.array(pil_img.convert("L"))
-        th, tw = self._icon_tmpl.shape
+        th, tw = tmpl.shape
 
         if th <= gray.shape[0] and tw <= gray.shape[1]:
-            result = cv2.matchTemplate(gray, self._icon_tmpl, cv2.TM_CCOEFF_NORMED)
+            result = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            if max_val >= 0.6:
+            if max_val >= 0.5:
                 x, y = max_loc
-                # 抹除图标及其左侧区域
-                bg_x = min(x + tw + 2, gray.shape[1] - 1)
-                fill_val = int(gray[y + th // 2, bg_x])
-                gray[0:gray.shape[0], 0:x + tw + 2] = fill_val
+                gray[0:gray.shape[0], 0:x + tw + 2] = 0
                 return Image.fromarray(gray)
 
-        # 模板匹配失败：按图标宽度固定裁掉左侧
+        # 模板匹配失败：按图标宽度抹黑左侧
         crop_x = min(tw + 2, gray.shape[1] - 1)
-        fill_val = int(gray[0, -1])
-        gray[:, 0:crop_x] = fill_val
+        gray[:, 0:crop_x] = 0
         return Image.fromarray(gray)
 
     def _ocr_to_int(self, pil_img):
@@ -149,6 +141,16 @@ class CardCapturer:
 
     def _ocr_text(self, pil_img, allow_chars=None):
         arr = np.array(pil_img)
+        h, w = arr.shape[:2]
+        # 小图放大 4x，CLAHE 增强对比度 (5/6 易混淆)
+        if h < 60 or w < 200:
+            arr = cv2.resize(arr, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
+        if len(arr.shape) == 3:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = arr
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        arr = clahe.apply(gray)
         results = _get_reader().readtext(arr, detail=0)
         text = "".join(results).strip()
         if allow_chars:
@@ -157,7 +159,7 @@ class CardCapturer:
 
     # ── 牌面识别 ──────────────────────────────
 
-    def _process_to_cards(self, pil_img, card_region, num_cards, tag="", suit_prefix="",
+    def _process_to_cards(self, pil_img, card_region, num_cards, suit_prefix="",
                           active_slots=None):
         """
         card_region: (x, y, w, h) 屏幕坐标，用于定位精确 rank 区域。
@@ -183,7 +185,6 @@ class CardCapturer:
             ry = rank_abs[1] - ry0
             rw, rh = rank_abs[2], rank_abs[3]
             rank_crop = pil_img.crop((rx, ry, rx + rw, ry + rh))
-            _save_debug(f"{tag}_slot{i}_rank.png", rank_crop)
             rank = self._ocr_rank(rank_crop)
 
             result = f"{rank}{suit}" if rank else f"?{suit}"
@@ -242,14 +243,13 @@ class CardCapturer:
                 if score > best_score:
                     best_score = score
                     best_rank = rank_char
-            if best_score >= 0.7 and best_rank != "?":
+            if best_score >= 0.8 and best_rank != "?":
                 return best_rank
 
         # 尝试 2: EasyOCR fallback
         gray4 = cv2.resize(gray, (gray.shape[1] * 4, gray.shape[0] * 4))
         reader = _get_reader()
         _, thresh = cv2.threshold(gray4, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        _save_debug(f"rank_thresh_{self._counter}.png", thresh)
         results = reader.readtext(thresh, detail=0)
         text = "".join(results).strip().upper()
         rank = self._extract_rank(text)
