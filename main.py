@@ -1,5 +1,6 @@
 import time
 import sys
+import threading
 from utils.config_manager import Config
 from utils.logger import setup_logger
 from server.statemachine import PokerStateMachine, AgentState, GamePhase
@@ -11,6 +12,24 @@ from controller.executor import PokerExecutor
 from server.evaluator import preflop_hand_strength, evaluate_hand, pot_odds_analysis
 
 log = setup_logger()
+
+
+def _start_log_server():
+    """在后台线程启动日志网页服务器"""
+    import socket
+    from log_server import LogHandler, ThreadingHTTPServer, start_tunnel
+    PORT = 8080
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), LogHandler)
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        log.info(f"日志服务器: http://{local_ip}:{PORT}")
+        public_url = start_tunnel()
+        if public_url:
+            log.info(f"公网访问: {public_url}")
+        server.serve_forever()
+    except OSError:
+        pass
 
 
 def main():
@@ -31,6 +50,9 @@ def main():
 
     log.info("系统就绪，开始扫描游戏窗口")
 
+    # 后台启动日志网页服务器
+    threading.Thread(target=_start_log_server, daemon=True).start()
+
     try:
         while True:
             detector.detect_and_update()
@@ -39,6 +61,9 @@ def main():
                 log.info(f">>> 行动回合 | 阶段={sm.current_phase.name}")
 
                 sm.agent_state = AgentState.THINKING
+
+                # 等待 UI 完全渲染
+                time.sleep(0.2)
 
                 # 手牌
                 if not sm.data["hand"]:
@@ -75,11 +100,12 @@ def main():
                          f"outs={eval_data['outs']}  "
                          f"起手={preflop[0]}")
 
-                # 记忆
+                # 记忆 — 记录底池轨迹用于分析对手牌力
                 current_event = {
                     "phase": sm.current_phase,
                     "pot": sm.data["pot"],
-                    "action": "detect"
+                    "to_call": to_call,
+                    "my_chips": sm.data["my_chips"],
                 }
                 memory.add_event(current_event)
                 semantic_hist = memory.get_semantic_history()

@@ -1,15 +1,12 @@
-# 德州扑克 AI 硬性决策约束
-
 preflop:
 
   no_fold_on_check: true
 
-  # 翻前底池为0时底池赔率失效(to_call/0=100%)，自动改用筹码占比
   equity_override:
-    when_pot_zero: "stack_pct"  # stack_pct = to_call/(筹码+to_call)*100，能合理区分便宜/贵
+    when_pot_zero: "stack_pct"
 
-  # 强牌：禁止弃牌
   hard_continue_rules:
+
     - min_score: 8
       max_equity: 100
       action: call_or_raise
@@ -28,9 +25,8 @@ preflop:
     - min_score: 2
       max_equity: 5
       action: call
-      desc: "带高张或同花的极边缘牌，成本极低必须看翻牌"
+      desc: "极边缘牌，仅极低成本防守"
 
-  # 新增：避免过度弃牌
   playable_hand_overrides:
 
     suited_ace:
@@ -66,12 +62,50 @@ preflop:
     avoid_overfolding: true
 
 
+
 postflop:
 
-  draw_by_equity:
-    min_outs: 4
-    turn_multiplier: 4
-    river_multiplier: 2
+  flop:
+
+    draw_by_equity:
+      min_outs: 4
+      multiplier: 4
+
+  turn:
+
+    draw_by_equity:
+      min_outs: 4
+      multiplier: 2
+
+  river:
+
+    use_outs: false
+
+    evaluate_priority:
+      - made_hand_strength
+      - showdown_value
+      - blocker_effect
+      - missed_draw_bluff
+      - bluff_catcher
+
+    value_bet:
+      min_made: "一对"
+
+    bluff:
+
+      allow_missed_draw_bluff: true
+
+      require_one_of:
+        - missed_flush_draw
+        - missed_straight_draw
+        - ace_blocker
+        - king_blocker
+
+    thin_value:
+      allow: true
+
+    bluff_catch:
+      enabled: true
 
   made_hand_protect:
     min_made: "一对"
@@ -81,40 +115,143 @@ postflop:
     min_outs: 8
     allow_raise: true
 
-  # ── 牌面纹理描述模板 ──
+
+
   board_labels:
+
     paired: "公牌有对子({rank})，须警惕三条/葫芦"
+
     monotone: "{count}张{suit}同花，同花威胁活跃"
+
     connected: "顺子听面活跃，连接度高"
+
     dry: "牌面很干，成牌价值可靠"
+
     default: "普通牌面"
 
-  # ── 手牌描述模板 (纯事实填空，不做强弱判断) ──
+
+
   hand_labels:
+
     straight_flush: "同花顺"
+
     quads: "四条{rank}"
+
     boat: "{trips}葫芦(比你大的葫芦还有{better}种)"
+
     flush: "{high}同花(比你大的同花有{better}种)"
+
     nut_flush: "坚果同花(最大)"
+
     straight: "{top}顺(比你大的顺子还有{better}种)"
+
     trips: "三条{rank}(比你大的三条还有{better}种)"
+
     two_pair: "{top}{bottom}两对(比你大的两对还有{better}种)"
+
     overpair: "超对{rank}(所有公牌都比{rank}小)"
+
     top_pair: "顶对{rank}, 踢脚{kicker}(对子是公牌中最大的)"
+
     middle_pair: "中对{rank}(公牌有{better}张牌比{rank}大)"
+
     bottom_pair: "底对{rank}(公牌有{better}张牌比{rank}大)"
+
     high_card_a: "A高, 无对无听牌"
+
     high_card_k: "K高"
+
     combo_draw: "花顺双抽({outs}outs)"
+
     nut_fd: "坚果同花听牌({outs}outs)"
+
     fd_overs: "同花听牌+高张({outs}outs)"
+
     fd: "同花听牌({outs}outs)"
+
     oesd_overs: "两头顺听牌+高张({outs}outs)"
+
     oesd: "两头顺听牌({outs}outs)"
+
     gutshot: "卡顺听牌({outs}outs)"
+
+    missed_fd: "错失同花听牌"
+
+    missed_oesd: "错失两头顺听牌"
+
+    missed_gutshot: "错失卡顺"
+
+    weak_showdown: "有摊牌价值"
+
+    no_showdown: "无摊牌价值"
+
     air: "空气牌(无对无听牌)"
 
+
+
+  # ── 战术模块（仅影响"如何打"，不影响"能否打"）──
+tactics:
+
+  disclaimer: "以下战术引导仅影响'如何最大化EV'，不影响'能否继续'。如果硬约束要求必须继续，则无论胜率高低都不得弃牌。硬约束优先于一切战术引导。"
+
+  pot_control:
+    enabled: true
+    guidance:
+      - "中等成牌（中对/底对）胜率足以继续但不足以造池时，优先 check/call 而非 bet/raise，控制底池规模"
+      - "高 SPR 且成牌非坚果时，即使有胜率也避免主动建造大底池"
+      - "边缘 showdown value 手牌优先进入摊牌，而非通过下注把更差牌赶走、更好牌留下"
+
+  protection_bet:
+    enabled: true
+    guidance:
+      - "强成牌（顶对/超对/两对+）在潮湿面可以适当下注保护，让听牌付费"
+      - "当对手可能存在大量听牌时，通过下注提高其决策成本，避免免费看牌"
+      - "当公共牌变干或对手范围较弱时，优先控制底池而非持续施压"
+
+  value_sizing:
+    enabled: true
+    guidance:
+      - "强牌（两对+）：0.5-0.75 pot 为主，逐步构建底池"
+      - "中等成牌（一对）：0.33-0.5 pot，兼顾价值与控池"
+      - "薄价值（A高/底对）：仅在对手明显弱或被动时下注 0.25-0.33 pot，否则 check"
+      - "坚果或接近坚果在河牌可考虑 1.2-2.0 pot 极化下注"
+
+  flop_strategy:
+    enabled: true
+    guidance:
+      - "干燥且高牌面：整体倾向下注获取价值与保护"
+      - "中等连接面：有击中或明显听牌时下注，否则以 check 为主"
+      - "潮湿或多连接面：降低整体下注频率，仅强牌或强听牌下注"
+      - "多人底池显著降低所有非强牌的主动下注频率"
+
+  turn_strategy:
+    enabled: true
+    guidance:
+      - "当公共牌出现明显改变量（补花/补顺/高张）时重新评估强度再决定是否继续施压"
+      - "当对手持续跟注且范围变强时，减少无效施压，转为控制底池"
+      - "当出现明显优势牌面时，可以加大下注压力获取价值"
+
+  check_raise:
+    enabled: true
+    guidance:
+      - "价值 check-raise：两对+ 在安全牌面可用于构建底池"
+      - "半诈唬 check-raise：强听牌（8+ outs）在合适牌面使用"
+      - "面对明显强范围或危险结构时减少 check-raise"
+      - "check-raise 后面对再加注时需显著收紧继续范围"
+
+  bluffing:
+    enabled: true
+    guidance:
+      - "诈唬必须同时满足：存在弃牌空间 + 牌面结构支持 + 合理故事线"
+      - "优先选择具有 blocker 的组合进行诈唬"
+      - "面对粘性玩家或多人底池降低诈唬频率"
+      - "无明确弃牌率时不强行诈唬"
+      - "河牌诈唬优先选择 missed draw + blocker 组合"
+
+
 general:
+
+  no_fold_on_check: true
 
   raise:
     pot_fraction_min: 0.5

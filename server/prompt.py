@@ -55,13 +55,18 @@ def _build_hard_rules(data):
     else:
         pf = strategy.get("postflop", {})
 
-        # 听牌 equity 约束
-        draw_cfg = pf.get("draw_by_equity", {})
-        if outs >= draw_cfg.get("min_outs", 4):
-            mult = draw_cfg.get("turn_multiplier", 4) if phase in ("FLOP", "TURN") else draw_cfg.get("river_multiplier", 2)
-            estimated_eq = outs * mult
-            if estimated_eq > equity:
-                rules.append(f"outs={outs} 估算胜率≈{estimated_eq}% > 所需{equity}%，禁止 fold")
+        # 听牌 equity 约束（按阶段读取 flop/turn/river）
+        phase_lower = phase.lower()
+        phase_cfg = pf.get(phase_lower, {})
+        draw_cfg = phase_cfg.get("draw_by_equity", {})
+        river_cfg = pf.get("river", {})
+        use_outs = river_cfg.get("use_outs", True) if phase == "RIVER" else True
+        if draw_cfg and use_outs:
+            if outs >= draw_cfg.get("min_outs", 4):
+                mult = draw_cfg.get("multiplier", 4)
+                estimated_eq = outs * mult
+                if estimated_eq > equity:
+                    rules.append(f"outs={outs} 估算胜率≈{estimated_eq}% > 所需{equity}%，禁止 fold")
 
         # 已成牌保护
         protect = pf.get("made_hand_protect", {})
@@ -69,6 +74,11 @@ def _build_hard_rules(data):
         if made and _made_rank(made) >= _made_rank(min_made):
             if to_call == 0:
                 rules.append(f"已成牌={made}，免费看牌，禁止 fold")
+
+        # 半诈唬规则
+        semi = pf.get("semi_bluff", {})
+        if semi.get("allow_raise") and outs >= semi.get("min_outs", 8):
+            rules.append(f"outs={outs} >= {semi.get('min_outs', 8)}，允许半诈唬加注")
 
     # ── 通用规则 ──
     general = strategy.get("general", {})
@@ -174,20 +184,70 @@ def _check_playable_overrides(data):
     return results
 
 
-def _build_strategy_guidance():
-    """从 YAML uncertainty_policy 生成软性策略引导"""
+def _build_strategy_guidance(data=None):
+    """从 YAML 生成软性策略引导（翻前 + 翻后 + 战术模块）"""
     strategy = _load_strategy()
-    up = strategy.get("preflop", {}).get("uncertainty_policy", {})
-    if not up:
-        return ""
-
     lines = []
+
+    # ── 翻前引导 ──
+    up = strategy.get("preflop", {}).get("uncertainty_policy", {})
     if up.get("prefer_call_over_fold_when_playable"):
         lines.append("- 当手牌有一定可玩性但不确定时，倾向于跟注（call）而非弃牌（fold）")
     if up.get("do_not_require_dominating_equity_preflop"):
         lines.append("- 翻前不需要压倒性胜率即可入池，赔率合适就可以继续")
     if up.get("avoid_overfolding"):
         lines.append("- 避免过度弃牌，特别是在有位置优势或底池赔率合适的情况下")
+
+    # ── 翻后阶段特定引导 ──
+    phase_name = ""
+    if data and data.get("current_phase", None):
+        phase_name = data["current_phase"].name if hasattr(data["current_phase"], "name") else str(data["current_phase"])
+        pf = strategy.get("postflop", {})
+
+        if phase_name == "RIVER":
+            river = pf.get("river", {})
+            priority = river.get("evaluate_priority", [])
+            if priority:
+                lines.append(f"- 河牌决策优先级: {' → '.join(priority)}")
+            vb = river.get("value_bet", {})
+            if vb.get("min_made"):
+                lines.append(f"- 价值下注门槛: 成牌 >= {vb['min_made']}")
+            bluff = river.get("bluff", {})
+            if bluff.get("allow_missed_draw_bluff"):
+                requires = bluff.get("require_one_of", [])
+                if requires:
+                    lines.append(f"- 允许诈唬（满足其一即可）: {'、'.join(requires)}")
+            if river.get("thin_value", {}).get("allow"):
+                lines.append("- 允许薄价值下注")
+            if river.get("bluff_catch", {}).get("enabled"):
+                lines.append("- 启用抓诈模式：评估对手是否可能在诈唬")
+        else:
+            # 翻牌/转牌：半诈唬
+            semi = pf.get("semi_bluff", {})
+            if semi.get("allow_raise"):
+                lines.append(f"- 听牌 outs >= {semi.get('min_outs', 8)} 时可考虑半诈唬加注")
+
+    # ── 通用战术模块（顶层 tactics）──
+    tactics = strategy.get("tactics", {})
+    if tactics:
+        disclaimer = tactics.get("disclaimer", "")
+        if disclaimer:
+            lines.append(f"- [原则] {disclaimer}")
+
+        for module_name in ("pot_control", "protection_bet", "value_sizing", "check_raise", "bluffing"):
+            mod = tactics.get(module_name, {})
+            if mod.get("enabled", True):
+                for g in mod.get("guidance", []):
+                    lines.append(f"- [{module_name}] {g}")
+
+        # 阶段特定的战术模块
+        phase_tactic_map = {"FLOP": "flop_strategy", "TURN": "turn_strategy"}
+        if phase_name in phase_tactic_map:
+            pmod = tactics.get(phase_tactic_map[phase_name], {})
+            if pmod.get("enabled", True):
+                for g in pmod.get("guidance", []):
+                    lines.append(f"- [{phase_tactic_map[phase_name]}] {g}")
+
     return "\n".join(lines) if lines else ""
 
 
@@ -196,7 +256,7 @@ _RANK_NAME = {14: "A", 13: "K", 12: "Q", 11: "J", 10: "T",
                9: "9", 8: "8", 7: "7", 6: "6", 5: "5", 4: "4", 3: "3", 2: "2"}
 
 
-def _build_hand_label(facts, labels):
+def _build_hand_label(facts, labels, phase=""):
     """根据客观事实 + YAML 标签模板 → 生成手牌描述"""
     made = facts["made_hand"]
     outs = facts.get("outs", 0)
@@ -256,6 +316,7 @@ def _build_hand_label(facts, labels):
     has_gs = "卡顺听牌" in draws
     high = facts.get("high_card_name", "?")
 
+    # 高牌 / 听牌未中（river）
     if has_fd and has_oesd:
         return labels["combo_draw"].format(outs=outs)
     if has_fd:
@@ -272,6 +333,21 @@ def _build_hand_label(facts, labels):
         return labels["oesd"].format(outs=outs)
     if has_gs:
         return labels["gutshot"].format(outs=outs)
+
+    # 河牌：高牌无听牌 → 错失听牌 / 摊牌价值 / 空气
+    if phase == "RIVER":
+        missed = facts.get("had_draws", [])
+        if "同花听牌" in missed:
+            return labels.get("missed_fd", labels["air"])
+        if "两头顺听牌" in missed:
+            return labels.get("missed_oesd", labels["air"])
+        if "卡顺听牌" in missed:
+            return labels.get("missed_gutshot", labels["air"])
+        if high in ("A", "K"):
+            return labels.get("weak_showdown", labels["air"])
+        if facts.get("pair_rank_name") or facts.get("has_showdown_value"):
+            return labels.get("weak_showdown", labels["air"])
+        return labels.get("no_showdown", labels["air"])
 
     if high == "A":
         return labels["high_card_a"]
@@ -339,7 +415,7 @@ def _build_board_and_hand_text(data):
 
         # 手牌质量
         hf = hand_strength_facts(hand, public)
-        parts.append(f"手牌: {_build_hand_label(hf, hand_labels)}")
+        parts.append(f"手牌: {_build_hand_label(hf, hand_labels, phase)}")
         parts.append(f"听牌: {', '.join(hf.get('draws', [])) or '无'} ({hf.get('outs_detail', '0 outs')})")
 
     return "\n".join(f"- {p}" for p in parts)
@@ -367,7 +443,7 @@ def build_poker_prompt(data, semantic_history):
 
     hand_assessment = _build_board_and_hand_text(data)
     hard_rules = _build_hard_rules(data)
-    strategy_guidance = _build_strategy_guidance()
+    strategy_guidance = _build_strategy_guidance(data)
 
     prompt = f"""
 你是一位顶级的德州扑克策略专家。
@@ -394,7 +470,8 @@ def build_poker_prompt(data, semantic_history):
 {strategy_guidance if strategy_guidance else "无特殊引导，按标准德州扑克策略决策。"}
 
 ### 6. 强制要求:
-- 上述硬性约束是绝对底线，决策不得违反；策略引导应尽量遵循。
+- 第4节硬性约束是绝对底线，必须无条件遵守。第5节策略引导仅为参考，当两者冲突时硬约束优先。
+- 例如: 硬约束说"禁止fold"则绝对不能fold，策略引导的任何相反建议均无效。
 - 如果选择 Raise，金额为整数，底池的 0.5x ~ 1.2x。
 - 必须只输出纯 JSON 格式，不得包含任何解释文字。
 
