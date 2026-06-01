@@ -1,0 +1,65 @@
+{
+    "display": {
+        "scaling_factor": 1.0,
+        "game_resolution": [1920, 1080],
+        "is_retina": false
+    },
+    "coords": {
+        "buttons": {
+            "fold": [108, 1168],
+            "call": [111, 981],
+            "raise": [112, 828]
+        },
+        "regions": {
+            "public": [37, 1390, 614, 107],
+            "hand": [699, 1389, 240, 111],
+            "pot": [2407, 89, 107, 46],
+            "raise_amount": [165, 389, 388, 466],
+            "my_chips": [1287, 1542, 145, 30],
+            "call_amount": [324, 956, 183, 40],
+            "round_winner": [37, 81, 374, 43],
+            "hand_rank_1": [706, 1401, 57, 52],
+            "hand_rank_2": [822, 1401, 54, 46],
+            "public_rank_1": [37, 1399, 62, 48],
+            "public_rank_2": [157, 1402, 59, 46],
+            "public_rank_3": [286, 1401, 65, 49],
+            "public_rank_4": [406, 1399, 57, 46],
+            "public_rank_5": [528, 1398, 61, 47]
+        },
+        "signals": {
+            "call_btn_pixel": [112, 982],
+            "public_card_1": [97, 1476],
+            "public_card_2": [214, 1473],
+            "public_card_3": [340, 1474],
+            "public_card_4": [463, 1471],
+            "public_card_5": [583, 1467],
+            "public_suit_1": [127, 1424],
+            "public_suit_2": [250, 1425],
+            "public_suit_3": [370, 1425],
+            "public_suit_4": [495, 1424],
+            "public_suit_5": [615, 1424],
+            "hand_suit_1": [793, 1424],
+            "hand_suit_2": [912, 1425],
+            "raise_slider_end": [112, 409]
+        }
+    },
+    "colors": {
+        "call_active_rgb": [255, 255, 255],
+        "card_back_rgb": [180, 20, 20],
+        "heart_rgb": [255, 0, 0],
+        "diamond_rgb": [37, 232, 214],
+        "spade_rgb": [0, 0, 0],
+        "club_rgb": [33, 123, 232],
+        "card_face_rgb": [255, 255, 255]
+    },
+    "log_server": {
+        "ngrok_token": "<your-ngrok-token>"
+    },
+    "ai": {
+        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "<your-api-key>",
+        "thinking": true,
+        "reasoning_effort": "high"
+    }
+}
