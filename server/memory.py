@@ -1,209 +1,302 @@
-# server/memory.py
+"""
+对手建模系统，分为两部分：
+
+1. 读牌（单局）— 本局对手动作链数据，注入 DecisionAgent prompt，
+   由同一次 LLM 调用完成手牌范围推断。不增加延迟。
+
+2. 形象（全场）— 跨牌局对手画像，手牌结束后异步调用 LLM 更新，
+   缓存后注入后续每手决策。零延迟影响。
+"""
+
+import json
+import re
+from collections import defaultdict
+
 
 class GameMemory:
     def __init__(self):
-        self.history = []  # 建议存储格式: {"phase": GamePhase.FLOP, "pot": 5300, "my_turn": True}
-        self.current_round_id = None
+        # ── 本局数据 ──
+        self.current_hand: list[dict] = []  # 本轮对手动作链
 
-    def reset(self):
-        print("[MEMORY] New round, reset history")
-        self.history = []
+        # ── 跨牌局数据 ──
+        self.completed_hands: list[dict] = []  # 每手牌结束后存摘要
+        self.profile: dict = {}                # LLM 生成的对手画像（缓存）
+        self.hands_since_profile_update: int = 0
+        self._actions_ingested: int = 0        # 已录入的对手动作数（防重复）
 
-    def add_event(self, event):
+    # ═══════════════════════════════════════════════════════════
+    # 数据录入
+    # ═══════════════════════════════════════════════════════════
+
+    def add_event(self, event: dict):
         """
-        event 格式建议: 
-        {
-            "phase": current_phase, 
-            "pot": current_pot, 
-            "action": "detect" # 或者是执行器的动作如 "raise"
-        }
+        记录本局一次事件。event 来自 main.py 的 on_decide 回调或 /observe。
+        格式: {"phase": GamePhase, "pot": int, "to_call": int, "my_chips": int,
+               "public_cards": [...], "action_type": "raise", "amount": 500}
         """
-        self.history.append(event)
+        self.current_hand.append(event)
 
-    def get_semantic_history(self):
+    def add_opponent_actions(self, actions: list):
+        """批量录入对手动作（增量：只追加上次录入后新增的动作）"""
+        new_actions = actions[self._actions_ingested:]
+        for a in new_actions:
+            self.current_hand.append({
+                "phase": a.phase,
+                "action_type": a.action_type,
+                "amount": a.amount,
+                "is_aggressor": a.is_aggressor,
+            })
+        self._actions_ingested = len(actions)
+
+    def finalize_hand(self, showdown_info: dict = None):
         """
-        将底池轨迹 + 跟注额转化为对手行动的博弈描述。
-        每次记录是我的回合状态 → 反推对手在两次回合之间做了什么。
-        核心: 对比翻前翻后行为一致性，发现矛盾 → 试探机会。
+        手牌结束，将本局摘要归档，触发画像更新。
+        showdown_info: {"winner": "hero"/"opponent", "opponent_showed": ["Ah","Kh"], ...}
         """
-        if not self.history:
-            return "本局刚开始。"
+        if not self.current_hand:
+            return
 
-        phase_cn = {"PRE_FLOP": "翻前", "FLOP": "翻牌圈", "TURN": "转牌圈", "RIVER": "河牌圈"}
+        summary = self._summarize_hand(self.current_hand, showdown_info)
+        self.completed_hands.append(summary)
 
-        def _phase_name(e):
-            p = e.get("phase")
-            name = p.name if hasattr(p, "name") else str(p)
-            return phase_cn.get(name, name)
+        # 限制总手牌存储（保留最近 50 手）
+        if len(self.completed_hands) > 50:
+            self.completed_hands = self.completed_hands[-50:]
 
-        def _bet_size_desc(to_call, pot):
-            if to_call <= 0 or pot <= 0:
-                return ""
-            pct = to_call / pot * 100
-            if pct > 80:
-                return f"重注({pct:.0f}%底池)"
-            elif pct > 50:
-                return f"中等偏大({pct:.0f}%底池)"
-            elif pct > 25:
-                return f"标准下注({pct:.0f}%底池)"
-            else:
-                return f"小注({pct:.0f}%底池)"
+        self.current_hand = []
+        self._actions_ingested = 0
+        self.hands_since_profile_update += 1
 
-        def _preflop_aggression(e):
-            """判断翻前对手的加注力度，模糊描述"""
-            to_call = e.get("to_call", 0)
-            chips = e.get("my_chips", 0)
-            if to_call <= 0 or chips <= 0:
-                return "passive"
-            pct = to_call / (chips + to_call) * 100
-            if pct > 12:
-                return "heavy"   # 大额加注，显示强牌
-            elif pct > 5:
-                return "medium"  # 中等加注，有一定牌力
-            else:
-                return "light"   # 小额/平跟，范围宽泛
+    def reset_round(self):
+        """新一局开始（如果上一局未正常结束则归档）"""
+        if self.current_hand:
+            self.finalize_hand()
+        else:
+            self.current_hand = []
 
-        _aggression_label = {
-            "heavy": "对手翻前大额加注，显示较强牌力",
-            "medium": "对手翻前中等加注，有一定牌力",
-            "light": "对手翻前小额加注/平跟，范围较宽",
-            "passive": "翻前无人加注，整体被动",
-        }
+    # ═══════════════════════════════════════════════════════════
+    # 读牌：本局对手动作链 → 注入 DecisionAgent prompt
+    # ═══════════════════════════════════════════════════════════
 
-        narrative = []
+    def get_hand_reading_context(self) -> str:
+        """
+        输出本局对手动作链的结构化文本，供 OpponentAgent/DecisionAgent 推断对手手牌范围。
+        只包含有实际对手动作的阶段，不含状态快照。
+        """
+        if not self.current_hand:
+            return ""
+
+        phase_cn = {"PRE_FLOP": "翻前", "FLOP": "翻牌", "TURN": "转牌", "RIVER": "河牌"}
+
+        # 按阶段分组，分离动作事件和状态事件
+        by_phase: dict[str, list[dict]] = defaultdict(list)
+        state_by_phase: dict[str, dict] = {}
+        for e in self.current_hand:
+            phase = e.get("phase", "")
+            if hasattr(phase, "name"):
+                phase = phase.name
+            if e.get("action_type"):
+                by_phase[phase].append(e)
+            elif "pot" in e:
+                state_by_phase[phase] = e
+
+        lines = []
         prev_pot = 0
-        preflop_aggression = None  # 记录翻前力度，用于后续对比
 
-        for i, e in enumerate(self.history):
-            label = _phase_name(e)
-            pot = e.get("pot", 0)
-            to_call = e.get("to_call", 0)
+        for phase_key in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            actions = by_phase.get(phase_key, [])
+            if not actions:
+                continue
 
-            if label == "翻前":
-                preflop_aggression = _preflop_aggression(e)
-
-                # 统计翻前事件数量（多轮 = re-raise）
-                pf_events = [ev for ev in self.history
-                             if _phase_name(ev) == "翻前"]
-                pf_idx = pf_events.index(e) if e in pf_events else 0
-
-                if pf_idx == 0:
-                    # 翻前首次行动
-                    if to_call > 0:
-                        narrative.append(
-                            f"翻前: 需跟注{to_call}，"
-                            f"{_aggression_label.get(preflop_aggression, '')}"
-                        )
-                    else:
-                        narrative.append("翻前: 免费看牌(check)，无人加注")
+            label = phase_cn.get(phase_key, phase_key)
+            actions_desc = []
+            for a in actions:
+                atype = a.get("action_type", "")
+                amt = a.get("amount", 0)
+                if atype in ("raise", "bet"):
+                    pot = state_by_phase.get(phase_key, {}).get("pot", prev_pot)
+                    pct = f" ({amt / pot * 100:.0f}%底池)" if pot > 0 else ""
+                    actions_desc.append(f"{atype} {amt}{pct}")
                 else:
-                    # 翻前再次轮到 → 有人 re-raise
-                    narrative.append(
-                        f"!!! 翻前再遇加注: 有人 re-raise，需再跟{to_call}。"
-                        f"对手范围进一步收窄，极可能持有强牌。"
-                    )
-            else:
-                # 翻后
-                pot_growth = pot - prev_pot
-                if to_call == 0:
-                    narrative.append(f"{label}: 对手check，底池维持{pot}")
-                else:
-                    sz = _bet_size_desc(to_call, pot)
-                    growth_note = f"底池从{prev_pot}→{pot}" if pot_growth > 0 else ""
-                    narrative.append(f"{label}: 对手下注{to_call}{' (' + sz + ')' if sz else ''}，{growth_note}")
+                    actions_desc.append(f"{atype} {amt}" if amt else atype)
 
-            prev_pot = pot
+            state = state_by_phase.get(phase_key, {})
+            pot_now = state.get("pot", prev_pot)
+            cards_now = state.get("public_cards", [])
+            cards_str = ", ".join(cards_now) if cards_now else "无"
 
-        # ── 翻前 vs 翻后 一致性分析 ──
-        postflop_events = [e for e in self.history if _phase_name(e) != "翻前"]
-        if preflop_aggression in ("heavy", "medium") and postflop_events:
-            # 翻前强势 → 检查翻后是否一致
-            post_tc = [e.get("to_call", 0) for e in postflop_events]
-            post_aggressive = sum(1 for t in post_tc if t > 0)
-            if post_aggressive == 0:
-                narrative.append(
-                    "→ 行为矛盾: 翻前加注强势，但翻后连续check示弱。"
-                    "对手可能持AK/AQ等高张未击中，或中对/小对子控池。"
-                    "若胜率允许，可考虑下注试探——对手无击中时很可能弃牌。"
+            lines.append(
+                f"{label}: {' → '.join(actions_desc)} | "
+                f"底池={pot_now} | 公共牌=[{cards_str}]"
+            )
+            prev_pot = pot_now
+
+        return "\n".join(f"  {l}" for l in lines) if lines else ""
+
+    # ═══════════════════════════════════════════════════════════
+    # 形象：跨牌局对手画像 → 注入 DecisionAgent prompt
+    # ═══════════════════════════════════════════════════════════
+
+    def get_profile_text(self) -> str:
+        """返回缓存的对手画像（LLM 生成），供 DecisionAgent 参考"""
+        if not self.profile:
+            return self._basic_profile_text()
+
+        lines = [
+            f"对手类型: {self.profile.get('archetype', '未知')}",
+            f"特征: {', '.join(self.profile.get('traits', []))}",
+            f"VPIP估算: {self.profile.get('vpip_estimate', 'N/A')}",
+            f"PFR估算: {self.profile.get('pfr_estimate', 'N/A')}",
+            f"弱点: {', '.join(self.profile.get('weaknesses', []))}",
+            f"建议对策: {self.profile.get('counter_strategy', '')}",
+            f"置信度: {self.profile.get('confidence', 0):.0%} (基于{self.profile.get('hands_observed', 0)}手)",
+        ]
+        return "\n".join(f"- {l}" for l in lines)
+
+    def _basic_profile_text(self) -> str:
+        """没有 LLM 画像时的兜底：基于简单统计"""
+        if not self.completed_hands:
+            return "- 暂无对手数据"
+
+        total = len(self.completed_hands)
+        # 统计各街侵略频率
+        agg_count = sum(1 for h in self.completed_hands if h.get("was_aggressive"))
+        agg_pct = agg_count / total * 100 if total > 0 else 0
+
+        return f"- 已观察{total}手 | 侵略频率≈{agg_pct:.0f}% | 数据有限，待更多手牌后生成详细画像"
+
+    # ═══════════════════════════════════════════════════════════
+    # 画像更新：调 LLM 生成对手形象
+    # ═══════════════════════════════════════════════════════════
+
+    def needs_profile_update(self) -> bool:
+        """是否需要更新画像（至少累积 3 手且有新数据）"""
+        return (len(self.completed_hands) >= 3
+                and self.hands_since_profile_update >= 3)
+
+    def update_profile(self, client, model: str):
+        """
+        异步调用 LLM 更新对手画像。调用方（main.py）负责在合适时机调用。
+        client: OpenAI client
+        model: 模型名
+        """
+        if len(self.completed_hands) < 3:
+            return
+
+        summaries = self._format_hand_summaries()
+        prompt = f"""你是一位顶级德州扑克对手分析专家。以下是同一对手在{len(self.completed_hands)}手牌中的行为摘要。
+
+请你分析并输出 JSON，不要包含任何解释。
+
+### 对手行为历史:
+{summaries}
+
+### 已有画像（如有，可在此基础上更新）:
+{json.dumps(self.profile, ensure_ascii=False) if self.profile else "无"}
+
+### 输出格式:
+{{{{
+  "archetype": "LAG/TAG/LP/TP/Manic/Unknown",
+  "traits": ["aggressive", "passive", "bluffs", "tight", "loose", "station", "nit"],
+  "vpip_estimate": "如 '25-30%'",
+  "pfr_estimate": "如 '15-20%'",
+  "weaknesses": ["可被利用的漏洞"],
+  "counter_strategy": "针对此对手的最佳策略简述（2-3句话）",
+  "confidence": 0.7,
+  "hands_observed": {len(self.completed_hands)}
+}}}}
+"""
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是德州扑克对手分析专家。始终只输出纯 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                timeout=15,
+            )
+            raw = response.choices[0].message.content
+            new_profile = self._parse_json(raw)
+
+            # 合并新旧画像（新数据权重更高）
+            if new_profile:
+                new_profile["hands_observed"] = len(self.completed_hands)
+                new_profile["confidence"] = min(
+                    new_profile.get("confidence", 0.5) + 0.05,
+                    0.95
                 )
-            elif post_aggressive < len(post_tc):
-                narrative.append(
-                    "→ 翻前强势但翻后有停顿，对手可能在某一街未击中后转为控池。"
-                )
-        elif preflop_aggression in ("light", "passive") and postflop_events:
-            # 翻前被动 → 翻后突然发力
-            post_tc = [e.get("to_call", 0) for e in postflop_events]
-            post_aggressive = sum(1 for t in post_tc if t > 0)
-            if post_aggressive >= len(post_tc) * 0.66:
-                narrative.append(
-                    "→ 行为矛盾: 翻前被动但翻后持续发力。"
-                    "对手可能翻牌击中强成牌(两对/三条/顺子/同花)，或利用牌面诈唬。"
-                    "需结合牌面纹理判断是真实击中还是诈唬。"
-                )
+                self.profile = new_profile
+                self.hands_since_profile_update = 0
 
-        # ── 整体翻后趋势 ──
-        if len(postflop_events) >= 2:
-            to_calls = [e.get("to_call", 0) for e in postflop_events]
-            non_zero = [t for t in to_calls if t > 0]
-            if len(non_zero) >= len(to_calls) * 0.66:
-                narrative.append("→ 翻后整体: 对手持续施压，侵略性强")
-            elif len(non_zero) == 0:
-                narrative.append("→ 翻后整体: 对手连续check示弱，整体偏被动")
-            else:
-                half = max(len(to_calls) // 2, 1)
-                first = sum(1 for t in to_calls[:half] if t > 0)
-                second = sum(1 for t in to_calls[half:] if t > 0)
-                if second > first:
-                    narrative.append("→ 翻后整体: 后期发力，可能在转牌/河牌击中")
-                elif first > second:
-                    narrative.append("→ 翻后整体: 前期积极、后期收力，可能未击中或控池")
+        except Exception as e:
+            print(f"[Memory] 画像更新失败: {e}")
 
-        return "\n".join(narrative)
+    def _summarize_hand(self, events: list[dict], showdown_info: dict = None) -> dict:
+        """将一手牌的原始事件压缩为摘要"""
+        phase_cn = {"PRE_FLOP": "翻前", "FLOP": "翻牌", "TURN": "转牌", "RIVER": "河牌"}
+        by_phase = defaultdict(list)
+        for e in events:
+            phase = e.get("phase", "")
+            if hasattr(phase, "name"):
+                phase = phase.name
+            by_phase[phase].append(e)
 
-    def get_history(self):
-        return self.history
+        summary_parts = []
+        was_aggressive = False
 
+        for pk in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            evts = by_phase.get(pk, [])
+            for e in evts:
+                atype = e.get("action_type", "")
+                amt = e.get("amount", 0)
+                pot = e.get("pot", 0)
+                pct = f"({amt / pot * 100:.0f}%pot)" if pot > 0 and amt > 0 else ""
+                summary_parts.append(f"{phase_cn.get(pk, pk)}:{atype}{' ' + str(amt) if amt else ''}{pct}")
+                if atype in ("raise", "bet"):
+                    was_aggressive = True
 
-if __name__ == "__main__":
-    from enum import Enum
+        result = {
+            "summary": " | ".join(summary_parts),
+            "was_aggressive": was_aggressive,
+            "street_count": len(by_phase),
+        }
 
-    class FakePhase(Enum):
-        PRE_FLOP = 1
-        FLOP = 2
-        TURN = 3
-        RIVER = 4
+        if showdown_info:
+            result["showdown"] = showdown_info
 
-    mem = GameMemory()
-    assert "刚开始" in mem.get_semantic_history()
-    print("[PASS] empty history")
+        return result
 
-    # ── 场景1: 翻前加注 → 翻后 check 示弱（矛盾）──
-    print("\n=== 场景1: 翻前强翻后弱（AK未击中）===")
-    mem.add_event({"phase": FakePhase.PRE_FLOP, "pot": 0, "to_call": 30, "my_chips": 200})
-    mem.add_event({"phase": FakePhase.FLOP, "pot": 90, "to_call": 0, "my_chips": 170})
-    mem.add_event({"phase": FakePhase.TURN, "pot": 90, "to_call": 0, "my_chips": 170})
-    sem = mem.get_semantic_history()
-    assert "翻前" in sem
-    assert "check" in sem or "无人加注" in sem
-    assert "矛盾" in sem
-    print(sem)
+    def _format_hand_summaries(self) -> str:
+        """格式化已完成手牌的摘要列表"""
+        lines = []
+        for i, h in enumerate(self.completed_hands[-20:], 1):  # 最近 20 手
+            lines.append(f"手牌{i}: {h['summary']}")
+            if h.get("showdown"):
+                sd = h["showdown"]
+                lines.append(f"  → 摊牌: {json.dumps(sd, ensure_ascii=False)}")
+        return "\n".join(lines)
 
-    mem.reset()
-    print("\n=== 场景2: 翻前 re-raise（多轮翻前）===")
-    mem.add_event({"phase": FakePhase.PRE_FLOP, "pot": 0, "to_call": 15, "my_chips": 200})
-    mem.add_event({"phase": FakePhase.PRE_FLOP, "pot": 45, "to_call": 40, "my_chips": 185})
-    mem.add_event({"phase": FakePhase.FLOP, "pot": 150, "to_call": 50, "my_chips": 145})
-    sem = mem.get_semantic_history()
-    assert "re-raise" in sem
-    print(sem)
+    def _parse_json(self, text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+            return {}
 
-    mem.reset()
-    print("\n=== 场景3: 翻前被动翻后发力（可能击中）===")
-    mem.add_event({"phase": FakePhase.PRE_FLOP, "pot": 0, "to_call": 0, "my_chips": 200})
-    mem.add_event({"phase": FakePhase.FLOP, "pot": 10, "to_call": 30, "my_chips": 200})
-    mem.add_event({"phase": FakePhase.TURN, "pot": 100, "to_call": 50, "my_chips": 170})
-    sem = mem.get_semantic_history()
-    assert "矛盾" in sem
-    print(sem)
+    # ═══════════════════════════════════════════════════════════
+    # 兼容旧接口
+    # ═══════════════════════════════════════════════════════════
 
-    print("\n全部通过")
+    def get_semantic_history(self) -> str:
+        """
+        旧接口，保留兼容。
+        返回本局对手动作链的文本描述。
+        """
+        return self.get_hand_reading_context()

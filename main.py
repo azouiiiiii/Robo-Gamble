@@ -1,39 +1,30 @@
-import time
+"""
+德州扑克 AI 决策引擎 — 三层并行架构。
+
+启动: python main.py → HTTP 服务器监听
+
+三层流水线:
+  1. L1 Profile Workers (x3)   — 对手画像 (on_opponent_action + hand_end 触发)
+  2. L2 Hand Reader Workers (x3) — 对手读牌 (on_opponent_action 触发)
+  3. L3 DecisionAgent          — 等 L1+L2 完成后整合 prompt, 开 thinking 决策
+
+L1 和 L2 并行消费对手队列。每批数据有两个标签:
+  profile_written + hand_read 都为 True → 数据移出缓冲区
+"""
+
 import sys
-import threading
 from utils.config_manager import Config
 from utils.logger import setup_logger
-from server.statemachine import PokerStateMachine, AgentState, GamePhase
-from server.memory import GameMemory
+from server.multi_memory import MultiOpponentMemory
 from server.decision import PokerDecision
-from perception.capture import CardCapturer
-from perception.detect import PokerDetector
-from controller.executor import PokerExecutor
-from server.evaluator import preflop_hand_strength, evaluate_hand, pot_odds_analysis
+from core.gamestate import GameState
+from core.adapter import create_adapter
 
 log = setup_logger()
 
 
-def _start_log_server():
-    """在后台线程启动日志网页服务器"""
-    import socket
-    from log_server import LogHandler, ThreadingHTTPServer, start_tunnel
-    PORT = 8080
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", PORT), LogHandler)
-        hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        log.info(f"日志服务器: http://{local_ip}:{PORT}")
-        public_url = start_tunnel()
-        if public_url:
-            log.info(f"公网访问: {public_url}")
-        server.serve_forever()
-    except OSError:
-        pass
-
-
 def main():
-    log.info("德州扑克 AI Agent 启动中")
+    log.info("德州扑克 AI 决策引擎启动中 (三层并行架构)")
 
     try:
         cfg = Config("config.json")
@@ -41,117 +32,88 @@ def main():
         log.critical(f"找不到配置文件: {e}")
         sys.exit(1)
 
-    sm = PokerStateMachine()
-    memory = GameMemory()
-    executor = PokerExecutor(cfg)
-    capturer = CardCapturer(cfg, executor)
-    detector = PokerDetector(sm, cfg, capturer)
     brain = PokerDecision(cfg)
+    memory = MultiOpponentMemory(
+        llm_client=brain.client,
+        opponent_model=cfg.get("ai.opponent_model", cfg.get("ai.model")),
+        profile_workers=3,
+        hand_reader_workers=3,
+    )
 
-    log.info("系统就绪，开始扫描游戏窗口")
+    adapter = create_adapter(cfg)
 
-    # 后台启动日志网页服务器
-    threading.Thread(target=_start_log_server, daemon=True).start()
+    # ═══════════════════════════════════════════════════════════
+    # 决策回调: POST /decide → L3 决策
+    # ═══════════════════════════════════════════════════════════
+
+    def on_decide(gs: GameState) -> dict:
+        try:
+            # 手牌结束 → 终局画像更新
+            if gs.phase.name == "SETTLEMENT" or gs.phase.name == "INIT":
+                for opp_id in memory.get_opponent_ids():
+                    memory.on_hand_end(opp_id)
+                if gs.phase.name == "INIT":
+                    log.info("新对局开始")
+
+            # 对手动作已由 bridge 通过 /observe 持续上报，此处不再重复路由
+            log.info(f"[Memory] {memory.status()}")
+
+            # 等 L1+L2 完成 (超时 5s，用旧缓存兜底)
+            opponent_context = memory.flush_and_wait(timeout=5.0)
+
+            # L3: DecisionAgent (唯一一次 thinking LLM 调用)
+            decision = brain.decide(gs, semantic_history="",
+                                    opponent_analysis=opponent_context)
+
+            log.info(
+                f"[L3] {gs.phase.name} | pos={gs.my_position} | "
+                f"hand={gs.hand} | board={gs.public_cards} | "
+                f"pot={gs.pot} to_call={gs.to_call} | "
+                f"→ {decision.get('action','?').upper()} "
+                f"amt={decision.get('amount')} conf={decision.get('confidence')}"
+            )
+
+            return decision
+        except Exception:
+            import traceback
+            log.error(f"on_decide 异常:\n{traceback.format_exc()}")
+            return {"action": "check", "amount": 0, "analysis": "internal error"}
+
+    # ═══════════════════════════════════════════════════════════
+    # 观察回调: POST /observe → L1+L2 持续更新
+    # ═══════════════════════════════════════════════════════════
+
+    def on_observe(event: dict):
+        # 对手动作实时上报 (bridge 持续推送)
+        opp_id = event.get("opp_id", "")
+        events = event.get("events", [])
+        if opp_id and events:
+            memory.on_opponent_action(opp_id, events)
+            return
+
+        # 结算归档
+        phase_str = event.get("phase", "")
+        if phase_str in ("SETTLEMENT", "INIT"):
+            opponent_ids = event.get("opponent_ids", [])
+            sd = event.get("showdown")
+            for opp_id in opponent_ids:
+                memory.on_hand_end(opp_id, sd)
+            log.info(f"[观察] 结算归档: {len(opponent_ids)}个对手")
+
+    adapter.set_observe_handler(on_observe)
+
+    log.info(f"监听 http://{adapter.host}:{adapter.port}")
+    log.info(f"DecisionAgent 模型: {brain.model}")
+    log.info(f"L1 画像 workers: 3 | L2 读牌 workers: 3 | L3 Decision: 1")
 
     try:
-        while True:
-            detector.detect_and_update()
+        adapter.run(on_decide)
+    finally:
+        memory.shutdown()
 
-            if sm.agent_state == AgentState.MY_TURN:
-                log.info(f">>> 行动回合 | 阶段={sm.current_phase.name}")
 
-                sm.agent_state = AgentState.THINKING
-
-                # 等待 UI 完全渲染
-                time.sleep(0.2)
-
-                # 手牌
-                if not sm.data["hand"]:
-                    hand = capturer.capture_hand()
-                    sm.data["hand"] = hand
-                    log.info(f"手牌: {capturer.get_readable_cards(hand)}")
-
-                # 公共牌
-                public = capturer.capture_public()
-                sm.data["public_cards"] = public
-                log.info(f"公共牌: {capturer.get_readable_cards(public)}")
-
-                # 底池 + 筹码
-                pot = capturer.capture_pot()
-                if pot > 0:
-                    sm.update_pot(pot)
-                chips = capturer.capture_my_chips()
-                if chips > 0:
-                    sm.data["my_chips"] = chips
-
-                # 悬停 Call 读取跟注金额（有数字=call，无=check）
-                executor.hover_call()
-                to_call = capturer.capture_call_amount()
-                log.info(f"底池={sm.data['pot']}  筹码={sm.data['my_chips']}  "
-                         f"跟注={to_call} ({'call' if to_call > 0 else 'check'})")
-
-                # 手牌评估
-                eval_data = evaluate_hand(sm.data["hand"], sm.data["public_cards"])
-                preflop = preflop_hand_strength(sm.data["hand"])
-                odds_ratio, odds_pct = pot_odds_analysis(sm.data["pot"], to_call)
-
-                log.info(f"成牌={eval_data['made_hand']}  "
-                         f"听牌={eval_data['draws'] or '无'}  "
-                         f"outs={eval_data['outs']}  "
-                         f"起手={preflop[0]}")
-
-                # 记忆 — 记录底池轨迹用于分析对手牌力
-                current_event = {
-                    "phase": sm.current_phase,
-                    "pot": sm.data["pot"],
-                    "to_call": to_call,
-                    "my_chips": sm.data["my_chips"],
-                }
-                memory.add_event(current_event)
-                semantic_hist = memory.get_semantic_history()
-
-                # AI 决策
-                log.info("请求 AI 决策...")
-                game_context = {
-                    "current_phase": sm.current_phase,
-                    "hand": sm.data["hand"],
-                    "public_cards": sm.data["public_cards"],
-                    "pot": sm.data["pot"],
-                    "my_chips": sm.data["my_chips"],
-                    "to_call": to_call,
-                    "hand_strength": preflop[0],
-                    "hand_score": preflop[1],
-                    "made_hand": eval_data["made_hand"],
-                    "draws": eval_data["draws"],
-                    "outs": eval_data["outs"],
-                    "outs_detail": eval_data["outs_detail"],
-                    "pot_odds": odds_ratio,
-                    "required_equity": odds_pct,
-                }
-
-                decision = brain.ask_ai(game_context, semantic_hist)
-                log.info(f"AI={decision.get('action').upper()}  "
-                         f"金额={decision.get('amount')}  "
-                         f"理由={decision.get('analysis')}")
-
-                # 执行
-                sm.agent_state = AgentState.ACTING
-                executor.execute(decision, capturer.capture_raise_amount)
-                log.info("动作执行完毕，等待下一轮")
-
-            # 新局清理
-            if sm.current_phase == GamePhase.INIT and len(memory.history) > 0:
-                memory.reset()
-                log.info("新对局，记忆已清空")
-
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        log.info("程序由用户停止")
-    except Exception as e:
-        log.critical(f"运行时崩溃: {e}")
-        import traceback
-        traceback.print_exc()
+# _route_opponent_actions 保留给纯 API 模式 (无 bridge /observe) 使用
+# 当前 bridge 模式下对手动作已通过 /observe 持续上报，/decide 不重复路由
 
 
 if __name__ == "__main__":

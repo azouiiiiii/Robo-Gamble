@@ -1,5 +1,6 @@
 # prompt.py
 import os
+import random
 import yaml
 
 _STRATEGY = None
@@ -14,6 +15,19 @@ def _load_strategy():
         with open(path, "r", encoding="utf-8") as f:
             _STRATEGY = yaml.safe_load(f)
     return _STRATEGY or {}
+
+
+def _resolve_position(position_str: str) -> dict:
+    """将平台位置字符串解析为 YAML tier 配置, 找不到返回空 dict"""
+    if not position_str:
+        return {}
+    strategy = _load_strategy()
+    pos_config = strategy.get("preflop", {}).get("positions", {})
+    if not pos_config:
+        return {}
+    mapping = pos_config.get("mapping", {})
+    tier_key = mapping.get(position_str.upper().strip(), position_str.lower())
+    return pos_config.get("tiers", {}).get(tier_key, {})
 
 
 def _build_hard_rules(data):
@@ -47,6 +61,9 @@ def _build_hard_rules(data):
 
         # playable_hand_overrides: 可玩牌类别
         rules.extend(_check_playable_overrides(data))
+
+        # 混合策略: 对边缘牌随机化入池/弃牌
+        rules.extend(_build_mixed_strategy_rule(data))
 
         if pf.get("no_fold_on_check") and to_call == 0:
             rules.append("当前为 check (免费看牌)，严禁选择 fold")
@@ -184,6 +201,83 @@ def _check_playable_overrides(data):
     return results
 
 
+def _build_mixed_strategy_rule(data):
+    """
+    翻前混合策略：对边缘手牌用随机数决定入池/弃牌，避免打法被对手摸透。
+
+    三层逻辑：
+      - 强牌 (score >= always_play): 不干预, 走原有 hard_continue_rules
+      - 垃圾牌 (score <= always_fold): 强制弃牌 (to_call>0时)
+      - 边缘牌 (中间区间): 按位置权重随机分配到 fold/call/raise
+
+    同一手牌+位置在同一次会话中结果一致（用 hand_cards 做种子）。
+    """
+    strategy = _load_strategy()
+    ms = strategy.get("preflop", {}).get("mixed_strategy", {})
+    if not ms.get("enabled"):
+        return []
+
+    score = data.get("hand_score", 0)
+    to_call = data.get("to_call", 0)
+    position = data.get("my_position", "")
+
+    tier = _resolve_position(position)
+    if not tier:
+        return []
+
+    tier_key = _resolve_tier_key(position)
+    tier_ms = ms.get("tiers", {}).get(tier_key, {})
+    if not tier_ms:
+        return []
+
+    tier_label = tier.get("label", position)
+    always_play = tier_ms.get("always_play_score", 7)
+    always_fold = tier_ms.get("always_fold_score", 3)
+
+    # 强牌: 不干预
+    if score >= always_play:
+        return []
+
+    # 免费看牌: 不强制弃牌
+    if to_call == 0:
+        return []
+
+    # 垃圾牌: 强制弃牌
+    if score <= always_fold:
+        return [f"[混合策略] {tier_label}位 手牌分数={score} <= {always_fold}，属于垃圾牌区间 → 强制弃牌"]
+
+    # ── 边缘牌: 随机化 ──
+    hand = data.get("hand", [])
+    seed_str = f"{'-'.join(sorted(hand))}:{tier_key}" if hand else f"{score}:{tier_key}"
+    rng = random.Random(seed_str)
+    roll = rng.random()
+
+    fw = tier_ms.get("fold_weight", 50)
+    cw = tier_ms.get("call_weight", 35)
+    rw = tier_ms.get("raise_weight", 10)
+    total = fw + cw + rw
+
+    fold_pct = fw / total
+    call_pct = cw / total
+
+    if roll < fold_pct:
+        return [f"[混合策略] {tier_label}位 手牌分数={score}在边缘区间({always_fold+1}-{always_play-1})，随机数落在弃牌区间[0,{fold_pct:.0%}) → 禁止入池，选择 fold"]
+    elif roll < fold_pct + call_pct:
+        return [f"[混合策略] {tier_label}位 手牌分数={score}在边缘区间，随机数落在跟注区间[{fold_pct:.0%},{(fold_pct+call_pct):.0%}) → 可以入池，倾向 call"]
+    else:
+        return [f"[混合策略] {tier_label}位 手牌分数={score}在边缘区间，随机数落在加注区间[{(fold_pct+call_pct):.0%},100%) → 可以入池，倾向 raise/3bet"]
+
+
+def _resolve_tier_key(position_str: str) -> str:
+    """将位置字符串解析为 YAML tier key"""
+    if not position_str:
+        return ""
+    strategy = _load_strategy()
+    pos_config = strategy.get("preflop", {}).get("positions", {})
+    mapping = pos_config.get("mapping", {})
+    return mapping.get(position_str.upper().strip(), position_str.lower())
+
+
 def _build_strategy_guidance(data=None):
     """从 YAML 生成软性策略引导（翻前 + 翻后 + 战术模块）"""
     strategy = _load_strategy()
@@ -197,6 +291,20 @@ def _build_strategy_guidance(data=None):
         lines.append("- 翻前不需要压倒性胜率即可入池，赔率合适就可以继续")
     if up.get("avoid_overfolding"):
         lines.append("- 避免过度弃牌，特别是在有位置优势或底池赔率合适的情况下")
+
+    # ── 位置策略引导 ──
+    if data and data.get("my_position"):
+        tier = _resolve_position(data["my_position"])
+        if tier and tier.get("guidance"):
+            lines.append(f"- [位置策略] {tier['guidance']}")
+            ms = strategy.get("preflop", {}).get("mixed_strategy", {})
+            if ms.get("enabled") and data.get("current_phase", None):
+                phase_name = data["current_phase"].name if hasattr(data["current_phase"], "name") else str(data["current_phase"])
+                if phase_name == "PRE_FLOP":
+                    tier_key = _resolve_tier_key(data["my_position"])
+                    tier_ms = ms.get("tiers", {}).get(tier_key, {})
+                    if tier_ms:
+                        lines.append(f"- [混合策略] 当前启用随机化入池: 强牌(score>={tier_ms.get('always_play_score','?')})正常玩, 垃圾牌(score<={tier_ms.get('always_fold_score','?')})强制弃, 边缘牌按权重随机决定")
 
     # ── 翻后阶段特定引导 ──
     phase_name = ""
@@ -421,7 +529,59 @@ def _build_board_and_hand_text(data):
     return "\n".join(f"- {p}" for p in parts)
 
 
-def build_poker_prompt(data, semantic_history):
+def build_opponent_prompt(hand_context: str, profile_text: str,
+                         opponent_actions_raw: list = None) -> str:
+    """
+    构建 OpponentAgent 的 prompt：专注对手行为分析，不做手牌决策。
+    输出结构化 JSON 对手分析报告。
+    """
+    actions_text = ""
+    if opponent_actions_raw:
+        actions_text = "\n".join(
+            f"- {a.get('phase', '?')}: {a.get('action_type', '?')} {a.get('amount', 0)}"
+            for a in opponent_actions_raw
+        )
+
+    return f"""你是一位德州扑克对手行为分析专家。请根据以下信息分析对手，只输出纯 JSON。
+
+### 本局对手动作链:
+{hand_context if hand_context else '暂无'}
+
+### 对手原始动作:
+{actions_text if actions_text else '暂无'}
+
+### 对手长期画像 (来自历史手牌):
+{profile_text if profile_text else '暂无历史数据'}
+
+### 输出 JSON 格式:
+{{{{"hand_range":"对手当前可能的手牌范围（1-2句话）","likely_strength":"weak/medium/strong/very_strong/unknown","aggression_level":"passive/neutral/aggressive/very_aggressive","bluff_probability":0.0,"exploitable_tendency":"对手当前可被利用的倾向（1句话）","recommended_approach":"针对此对手的建议策略（1-2句话）"}}}}
+"""
+
+
+def build_prompt_from_state(gs, eval_data, preflop, odds, semantic_history,
+                           opponent_analysis=""):
+    """新接口：接受 GameState + 确定性评估结果 + 对手分析报告，构建完整 prompt"""
+    data = {
+        "current_phase": gs.phase,
+        "hand": gs.hand,
+        "public_cards": gs.public_cards,
+        "pot": gs.pot,
+        "my_chips": gs.my_chips,
+        "to_call": gs.to_call,
+        "my_position": gs.my_position,
+        "hand_strength": preflop[0],
+        "hand_score": preflop[1],
+        "made_hand": eval_data["made_hand"],
+        "draws": eval_data["draws"],
+        "outs": eval_data["outs"],
+        "outs_detail": eval_data["outs_detail"],
+        "pot_odds": odds[0],
+        "required_equity": odds[1],
+    }
+    return build_poker_prompt(data, semantic_history, opponent_analysis)
+
+
+def build_poker_prompt(data, semantic_history, opponent_analysis=""):
     hand_str = ", ".join(data['hand']) if data['hand'] else "尚未看牌或已弃牌"
     public_str = ", ".join(data['public_cards']) if data['public_cards'] else "桌面无公共牌"
 
@@ -445,6 +605,20 @@ def build_poker_prompt(data, semantic_history):
     hard_rules = _build_hard_rules(data)
     strategy_guidance = _build_strategy_guidance(data)
 
+    opponent_section = ""
+    if opponent_analysis:
+        if isinstance(opponent_analysis, dict):
+            opponent_section = (
+                f"- 对手手牌范围: {opponent_analysis.get('hand_range', '未知')}\n"
+                f"- 牌力评估: {opponent_analysis.get('likely_strength', 'unknown')}\n"
+                f"- 侵略性: {opponent_analysis.get('aggression_level', 'neutral')}\n"
+                f"- 诈唬概率: {opponent_analysis.get('bluff_probability', 0):.0%}\n"
+                f"- 可剥削倾向: {opponent_analysis.get('exploitable_tendency', '')}\n"
+                f"- 建议策略: {opponent_analysis.get('recommended_approach', '')}"
+            )
+        else:
+            opponent_section = str(opponent_analysis)
+
     prompt = f"""
 你是一位顶级的德州扑克策略专家。
 
@@ -463,15 +637,18 @@ def build_poker_prompt(data, semantic_history):
 ### 3. 手牌与牌面分析:
 {hand_assessment}
 
-### 4. 硬性约束 (绝对不可违反):
+### 4. 对手分析:
+{opponent_section if opponent_section else "暂无对手数据。"}
+
+### 5. 硬性约束 (绝对不可违反):
 {hard_rules if hard_rules else "无特殊约束，自由决策。"}
 
-### 5. 策略引导 (遵循这些原则):
+### 6. 策略引导 (遵循这些原则):
 {strategy_guidance if strategy_guidance else "无特殊引导，按标准德州扑克策略决策。"}
 
-### 6. 强制要求:
-- 第4节硬性约束是绝对底线，必须无条件遵守。第5节策略引导仅为参考，当两者冲突时硬约束优先。
-- 例如: 硬约束说"禁止fold"则绝对不能fold，策略引导的任何相反建议均无效。
+### 7. 强制要求:
+- 第5节硬性约束是绝对底线，必须无条件遵守。第6节策略引导仅为参考，当两者冲突时硬约束优先。
+- 第4节对手分析中，本局动作链反映对手当前手牌倾向，长期画像反映其整体风格。两者结合判断。
 - 如果选择 Raise，金额为整数，底池的 0.5x ~ 1.2x。
 - 必须只输出纯 JSON 格式，不得包含任何解释文字。
 

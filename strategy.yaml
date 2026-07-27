@@ -56,6 +56,124 @@ preflop:
       action_if_reasonable_price: call
       max_equity: 28
 
+  positions:
+    # 将平台位置名映射到标准tier
+    mapping:
+      BTN: "button"
+      BU: "button"
+      CO: "cutoff"
+      HJ: "middle"
+      MP: "middle"
+      UTG: "early"
+      UTG1: "early"
+      EP: "early"
+      SB: "small_blind"
+      BB: "big_blind"
+
+    # 翻前 GTO 位置策略
+    # open_min_score: 无人加注时,手牌分数低于此门槛应弃牌
+    # vs_raise_min_score: 面对加注时,手牌分数低于此门槛应弃牌(更紧)
+    # max_equity: 可继续的最大所需胜率,超过此值赔率不够
+    tiers:
+      early:
+        label: "前位(UTG)"
+        open_min_score: 7
+        vs_raise_min_score: 8
+        max_equity: 12
+        fold_msg: "前位范围最紧(约12-15%)，边缘牌在不利位置长期-EV，应弃牌"
+        guidance: "前位只用强牌入池(88+/ATs+/AQo+)。即使赔率合适，在不利位置玩边缘牌长期亏损。优先3bet而非跟注以减少多人底池。"
+
+      middle:
+        label: "中位(MP/HJ)"
+        open_min_score: 5
+        vs_raise_min_score: 6
+        max_equity: 20
+        fold_msg: "中位范围适中(约18-22%)，手牌不够强且赔率不够好，应弃牌"
+        guidance: "中位范围适中(66+/A9s+/ATo+/KJo+)。面对前位加注需尊重其紧范围，非强牌不宜纠缠。"
+
+      cutoff:
+        label: "关煞位(CO)"
+        open_min_score: 3
+        vs_raise_min_score: 5
+        max_equity: 30
+        fold_msg: "CO范围可放宽但赔率不支持继续，应弃牌"
+        guidance: "关煞位范围放宽(约25-30%)，可用同花连牌/同花A投机入池。前面全弃时可积极偷盲，面对前位加注仍需尊重。"
+
+      button:
+        label: "庄位(BTN)"
+        open_min_score: 2
+        vs_raise_min_score: 3
+        max_equity: 40
+        fold_msg: "BTN范围最宽但赔率不支持，应弃牌"
+        guidance: "庄位范围最宽(约40-45%)，有绝对位置优势。翻后有位置可弥补手牌质量不足，可积极偷盲和隔离。"
+
+      small_blind:
+        label: "小盲(SB)"
+        open_min_score: 5
+        vs_raise_min_score: 6
+        max_equity: 20
+        fold_msg: "SB位置最差，边缘牌在不利位置难以盈利，应弃牌"
+        guidance: "小盲位置最差(翻后最先行动)。优先3bet而非跟注，避免在不利位置用边缘牌打多人底池。弃牌率应高于其他位置。"
+
+      big_blind:
+        label: "大盲(BB)"
+        open_min_score: 2
+        vs_raise_min_score: 3
+        max_equity: 45
+        fold_msg: "BB防守范围可放宽但赔率不支持，应弃牌"
+        guidance: "大盲已投入盲注+翻前最后行动，防守范围可放宽(约40-50%)。面对BTN/CO偷盲可更激进地3bet捍卫盲注。"
+
+  mixed_strategy:
+    enabled: true
+    # 三层逻辑:
+    #   score >= always_play_score → 强牌,走现有 hard_continue_rules, 不随机化
+    #   score <= always_fold_score → 垃圾牌,强制弃牌 (to_call>0时)
+    #   中间区间 → 边缘牌,按权重随机分配到 fold/call/raise
+    #
+    # 随机种子: hand_cards + position, 同手牌同位结果一致, 不同手牌独立
+    tiers:
+      early:
+        always_play_score: 7
+        always_fold_score: 3
+        fold_weight: 55
+        call_weight: 35
+        raise_weight: 10
+
+      middle:
+        always_play_score: 6
+        always_fold_score: 2
+        fold_weight: 40
+        call_weight: 40
+        raise_weight: 20
+
+      cutoff:
+        always_play_score: 5
+        always_fold_score: 1
+        fold_weight: 25
+        call_weight: 45
+        raise_weight: 30
+
+      button:
+        always_play_score: 4
+        always_fold_score: 0
+        fold_weight: 15
+        call_weight: 45
+        raise_weight: 40
+
+      small_blind:
+        always_play_score: 6
+        always_fold_score: 2
+        fold_weight: 40
+        call_weight: 30
+        raise_weight: 30
+
+      big_blind:
+        always_play_score: 4
+        always_fold_score: 0
+        fold_weight: 25
+        call_weight: 50
+        raise_weight: 25
+
   uncertainty_policy:
     prefer_call_over_fold_when_playable: true
     do_not_require_dominating_equity_preflop: true
