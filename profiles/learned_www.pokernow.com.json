@@ -1,0 +1,276 @@
+{
+  "profile_id": "learned_www.pokernow.com",
+  "version": 2,
+  "source": "learned",
+  "status": "draft",
+  "protocol": "gC_state_snapshot",
+  "host": "www.pokernow.com",
+  "confidence": 0.65,
+  "event_rules": {
+    "state_source": {
+      "description": "Received gC message contains complete or partial state; fields not in a gC should be kept from prior state.",
+      "confidence": 0.8,
+      "evidence": [
+        "evt-9-fa0e2a99",
+        "evt-43-9256c9e5"
+      ]
+    },
+    "hero_identity": {
+      "description": "HERO_ID is registered_message.currentPlayer.id; it is also the key for the hero's private cards and street contributions.",
+      "confidence": 0.95,
+      "evidence": [
+        "evt-4-77803b2f",
+        "evt-9-fa0e2a99"
+      ]
+    },
+    "hero_actions_source": {
+      "description": "Only this client's outgoing actions are present in SENT action messages; opponents appear only as gC state changes.",
+      "confidence": 0.65,
+      "evidence": [
+        "evt-18-d0d15ace",
+        "evt-23-988c3a41"
+      ]
+    }
+  },
+  "field_mapping": {
+    "phase": {
+      "path": "gC.gT[1]; map 0=PRE_FLOP,1=FLOP,2=TURN,3=RIVER,5=SETTLEMENT",
+      "confidence": 0.75,
+      "evidence": [
+        "evt-20-df1311c8",
+        "evt-51-a5a0ac2d"
+      ]
+    },
+    "hand": {
+      "path": "gC.pC.<HERO_ID>.cards[*].value; HERO_ID from registered_message.currentPlayer.id",
+      "confidence": 0.95,
+      "evidence": [
+        "evt-4-77803b2f",
+        "evt-9-fa0e2a99"
+      ]
+    },
+    "public_cards": {
+      "path": "gC.oTC[\"1\"]",
+      "confidence": 0.88,
+      "evidence": [
+        "evt-20-df1311c8",
+        "evt-36-ed590704"
+      ]
+    },
+    "pot": {
+      "path": "gC.pot; if current-street bets exist then pot + sum(numeric gC.tB values) is current pot",
+      "confidence": 0.5,
+      "evidence": [
+        "evt-28-501b2d72",
+        "evt-51-a5a0ac2d"
+      ]
+    },
+    "players": {
+      "path": "registered_message.gameState.players merged with gC.players and gC.pGS",
+      "confidence": 0.82,
+      "evidence": [
+        "evt-4-77803b2f",
+        "evt-20-df1311c8"
+      ]
+    },
+    "current_player": {
+      "path": "gC.pITT; gC.cPI when present",
+      "confidence": 0.8,
+      "evidence": [
+        "evt-15-c28969a0",
+        "evt-25-3809084b"
+      ]
+    },
+    "previous_bet_size": {
+      "path": "gC.cHB; 0 when absent or cleared",
+      "confidence": 0.85,
+      "evidence": [
+        "evt-9-fa0e2a99",
+        "evt-43-9256c9e5"
+      ]
+    },
+    "hero_action_size": {
+      "path": "numeric(gC.tB.<HERO_ID>); absent/\"check\"/\"<D>\" treated as 0",
+      "confidence": 0.8,
+      "evidence": [
+        "evt-24-88bacc3f",
+        "evt-40-e9da5b61"
+      ]
+    },
+    "hero_position": {
+      "path": "derived from gC.dealerID, gC.sBPI, gC.bBPI relative to HERO_ID",
+      "confidence": 0.7,
+      "evidence": [
+        "evt-9-fa0e2a99",
+        "evt-52-c9234733"
+      ]
+    },
+    "showdown": {
+      "path": "gC.gameResult plus gC.pC showing true hole-cards",
+      "confidence": 0.85,
+      "evidence": [
+        "evt-51-a5a0ac2d"
+      ]
+    }
+  },
+  "transforms": {
+    "card_encoding_only_if_needed": {
+      "description": "Card strings are rank then suit, e.g. '9h'; null/absent in pC means the card is not visible to hero.",
+      "confidence": 0.85,
+      "evidence": [
+        "evt-9-fa0e2a99",
+        "evt-51-a5a0ac2d"
+      ]
+    }
+  },
+  "state_rules": {
+    "phase": {
+      "description": "Use gC.gT[1]: 0 hand-start/pre-flop, 1 flop, 2 turn, 3 river, 5 settlement; verify with oTC public-card count and gameResult presence.",
+      "confidence": 0.75,
+      "evidence": [
+        "evt-20-df1311c8",
+        "evt-36-ed590704"
+      ]
+    },
+    "to_call": {
+      "description": "to_call = max(cHB - current_street_hero_contribution, 0); current_street_hero_contribution is numeric tB[HERO_ID], else 0; if no cHB then to_call=0.",
+      "confidence": 0.7,
+      "evidence": [
+        "evt-43-9256c9e5",
+        "evt-28-501b2d72"
+      ]
+    },
+    "action_history": {
+      "description": "No explicit action-history field is populated. Build from SENT hero actions plus gC diffs in tB/cHB; amount growth on a player implies bet/call, 'check' implies check. Dedupe gC frames that only update timers and do not change decision state.",
+      "confidence": 0.45,
+      "evidence": [
+        "evt-18-d0d15ace",
+        "evt-24-88bacc3f"
+      ]
+    },
+    "new_hand": {
+      "description": "New hand starts when gC has fresh two-card hero pC, gC.gT[1]=0, dealer/blinds rotate, and previous gameResult is cleared.",
+      "confidence": 0.85,
+      "evidence": [
+        "evt-9-fa0e2a99",
+        "evt-52-c9234733"
+      ]
+    },
+    "state_merge": {
+      "description": "Treat each gC as an incremental patch; omitted fields keep previous values. tB is current-street contribution; '<D>' clears old street values. Pot may be the pre-bet pot; current pot should be pot plus numeric tB sums until settlement resets pot.",
+      "confidence": 0.55,
+      "evidence": [
+        "evt-20-df1311c8",
+        "evt-51-a5a0ac2d"
+      ]
+    }
+  },
+  "evidence": [
+    {
+      "type": "source_segment",
+      "hand_id": "hand-001",
+      "event_count": 106,
+      "source_session_path": "learning_sessions/session_20260902_154752.jsonl"
+    }
+  ],
+  "ambiguities": [
+    {
+      "topic": "phase mapping when gT[1]=4",
+      "alternatives": [
+        "gT[1]=4 may be an all-in/showdown-only street",
+        "not observed in current capture"
+      ],
+      "reason": "Only values 0,1,2,3,5 are observed."
+    },
+    {
+      "topic": "pot semantics",
+      "alternatives": [
+        "gC.pot is total pot",
+        "gC.pot is pot before current-street bets and tB must be added"
+      ],
+      "reason": "pot is missing during current-street betting, and pot=0 at settlement while gameResult reports gained 120."
+    },
+    {
+      "topic": "opponent action types",
+      "alternatives": [
+        "derive from gC tB/cHB diffs",
+        "cannot distinguish bet/call/raise/fold reliably"
+      ],
+      "reason": "Capture contains no opponent SENT action messages."
+    }
+  ],
+  "validations": [
+    {
+      "target": "field_mapping.phase",
+      "status": "supported",
+      "confidence": 0.75,
+      "evidence": [
+        "evt-20-df1311c8",
+        "evt-36-ed590704"
+      ],
+      "reason": "gT street index aligns with number of public cards and settlement result."
+    },
+    {
+      "target": "field_mapping.hand",
+      "status": "supported",
+      "confidence": 0.9,
+      "evidence": [
+        "evt-9-fa0e2a99"
+      ],
+      "reason": "Registered currentPlayer is the same player whose pC cards have values in gC."
+    },
+    {
+      "target": "state_rules.to_call",
+      "status": "supported",
+      "confidence": 0.75,
+      "evidence": [
+        "evt-43-9256c9e5",
+        "evt-49-d9a9566c"
+      ],
+      "reason": "cHB=20 with no hero tB was followed by a hero PLAYER_CALL."
+    },
+    {
+      "target": "field_mapping.pot",
+      "status": "conflict",
+      "confidence": 0.4,
+      "evidence": [
+        "evt-28-501b2d72",
+        "evt-51-a5a0ac2d"
+      ],
+      "reason": "Pot field is absent in several current-street frames and resets to 0 while gameResult.gained=120."
+    },
+    {
+      "target": "state_rules.action_history",
+      "status": "not_observed",
+      "confidence": 0.4,
+      "evidence": [
+        "evt-18-d0d15ace",
+        "evt-24-88bacc3f"
+      ],
+      "reason": "No complete action stream for all players exists in this capture."
+    }
+  ],
+  "metadata": {
+    "learner": "llm_v1",
+    "model": "deepseek-v4-flash",
+    "hand_id": "hand-001",
+    "source_event_count": 106,
+    "source_session_path": "learning_sessions/session_20260902_154752.jsonl",
+    "chunk_count": 1,
+    "raw_events_are_authoritative": true,
+    "input_compression": {
+      "version": 1,
+      "semantics": "lossless_view_with_explicit_url_filters",
+      "original_event_count": 106,
+      "included_event_count": 69,
+      "excluded_event_count": 37,
+      "original_event_chars": 131807,
+      "compressed_document_chars": 55402,
+      "reduction_ratio": 0.5797
+    },
+    "profile_contract": "decision_state_v1",
+    "analysis_mode": "initial_discovery",
+    "previous_mapping_version": "learned_www.pokernow.com:v1"
+  },
+  "updated_at": "2026-09-07T01:32:30.038065+00:00"
+}

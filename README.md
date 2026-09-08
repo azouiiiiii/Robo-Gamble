@@ -64,10 +64,31 @@ python main.py  # 启动 AI 引擎，监听 :8765
 python bridge.py --auto --url http://localhost:7001
 ```
 
-通过 Playwright CDP 拦截浏览器 WebSocket 帧，自动提取游戏状态、上报对手动作、执行 AI 决策。支持两种模式：
+通过 Playwright CDP 拦截浏览器网络数据，提取游戏状态、上报对手动作并按模式执行后续流程。旧版兼容参数支持两种行为：
 
 - `--auto`：自动执行决策
 - 不加 `--auto`：仅页面浮层显示建议
+
+Bridge 现在也支持三种显式运行模式：
+
+```bash
+python bridge.py --mode learn    # 只采集原始网络流，保存到 learning_sessions/
+python bridge.py --mode verify   # 固定 Profile 解析，并在页面浮层显示结果
+python bridge.py --mode auto     # 固定 verified/builtin Profile，运行 L1/L2/L3 并自动执行
+```
+
+学习模式按键盘左上角的反引号键 `` ` `` / ``~`` 手动标记牌局边界。边界后的
+`learning.overlap_ms` 时间窗口会以引用方式同时归入上一局尾部和下一局头部，
+学习任务进入后台队列，采集不会等待学习分析完成。队列参数位于 `learning`：
+`boundary_key`、`overlap_ms`、`job_queue_size`、`worker_count`。
+
+启用 `learning.auto_learn` 后，每个已完成分段会调用 LearningAgent，保存或增量更新
+`profiles/learned_<host>.json`。同一局的任务状态、Profile 路径与置信度会写回对应
+`learning_sessions/*.jsonl` 的 `learning_result` 记录；请求超时由
+`learning.request_timeout_seconds` 控制。
+
+`--auto` 仍然兼容，等同于 `--mode auto`。模式也可通过 `config.json` 的
+`bridge.mode` 配置；`bridge.mapping_profile` 指定使用的 Profile。
 
 ---
 
@@ -138,6 +159,9 @@ texas/
 │   ├── protocol.py          # Socket.IO 线协议解析
 │   ├── aggregator.py        # 事件流 → GameState 聚合
 │   ├── interceptor.py       # Playwright CDP 拦截 + 决策路由
+│   ├── hand_segments.py     # 人工边界、overlap 引用分段
+│   ├── learning_queue.py    # 异步学习任务队列
+│   ├── boundary_listener.py # 反引号全局键监听
 │   └── browser.py           # 浏览器生命周期管理
 │
 └── utils/

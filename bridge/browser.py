@@ -3,7 +3,7 @@
 from playwright.async_api import async_playwright, Page
 
 from .interceptor import WebSocketInterceptor
-from .aggregator import GameStateAggregator
+from .data_provider import ProfileGameDataProvider
 
 
 _INIT_SCRIPT = """
@@ -18,7 +18,14 @@ CDP_PORT = 9222
 DEFAULT_GAME_URL = "http://localhost:8080"
 
 
-async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int, verbose: bool = False) -> tuple | None:
+async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int,
+                               verbose: bool = False, network_config: dict | None = None,
+                               profile_id: str = "legacy_socketio_v1",
+                               profile_dir: str = "profiles",
+                               mode: str = "verify",
+                               learning_session_dir: str = "learning_sessions",
+                               learning_config: dict | None = None,
+                               learning_handler=None) -> tuple | None:
     """尝试连接已有 Chrome，失败返回 None"""
     try:
         pw = await async_playwright().start()
@@ -37,8 +44,13 @@ async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int, v
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = await ctx.new_page()
 
-        interceptor = WebSocketInterceptor(agent_url, verbose=verbose)
-        interceptor.attach(page, auto_mode=auto_mode)
+        interceptor = WebSocketInterceptor(
+            agent_url, verbose=verbose, network_config=network_config,
+            profile_id=profile_id, profile_dir=profile_dir, mode=mode,
+            learning_session_dir=learning_session_dir,
+            learning_config=learning_config, learning_handler=learning_handler,
+        )
+        await interceptor.attach(page, auto_mode=auto_mode)
         await page.evaluate(_INIT_SCRIPT)
 
         print("[Bridge] 刷新页面以截获 WebSocket 重连...")
@@ -52,9 +64,21 @@ async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int, v
         return None
 
 
-async def launch_new(game_url: str, agent_url: str, auto_mode: bool, cdp_port: int, verbose: bool = False) -> tuple:
+async def launch_new(game_url: str, agent_url: str, auto_mode: bool, cdp_port: int,
+                     verbose: bool = False, network_config: dict | None = None,
+                     profile_id: str = "legacy_socketio_v1",
+                     profile_dir: str = "profiles",
+                     mode: str = "verify",
+                     learning_session_dir: str = "learning_sessions",
+                     learning_config: dict | None = None,
+                     learning_handler=None) -> tuple:
     """拉起新 Chrome，同时打开 CDP 端口供后续连接"""
-    interceptor = WebSocketInterceptor(agent_url, verbose=verbose)
+    interceptor = WebSocketInterceptor(
+        agent_url, verbose=verbose, network_config=network_config,
+        profile_id=profile_id, profile_dir=profile_dir, mode=mode,
+        learning_session_dir=learning_session_dir,
+        learning_config=learning_config, learning_handler=learning_handler,
+    )
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
         headless=False,
@@ -66,7 +90,7 @@ async def launch_new(game_url: str, agent_url: str, auto_mode: bool, cdp_port: i
     context = await browser.new_context(viewport={"width": 1280, "height": 900})
     page = await context.new_page()
     await page.add_init_script(_INIT_SCRIPT)
-    interceptor.attach(page, auto_mode=auto_mode)
+    await interceptor.attach(page, auto_mode=auto_mode)
 
     if game_url:
         print(f"[Bridge] 打开游戏: {game_url}")
@@ -102,6 +126,13 @@ async def recover_state(page: Page, interceptor: WebSocketInterceptor):
         """)
         if result and result.get("userId"):
             print(f"[Bridge] 从页面恢复玩家: {result.get('nickName')} (userId={result['userId']})")
-            interceptor.aggregator = GameStateAggregator(result["userId"], verbose=interceptor.verbose)
+            if interceptor.mode.value == "learn":
+                return
+            interceptor.data_provider = ProfileGameDataProvider.from_registry(
+                interceptor.profile_id,
+                result["userId"],
+                verbose=interceptor.verbose,
+                profile_dir=interceptor.profile_dir,
+            )
     except Exception:
         pass

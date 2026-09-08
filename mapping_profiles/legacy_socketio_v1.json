@@ -1,0 +1,58 @@
+{
+  "profile_id": "legacy_socketio_v1",
+  "version": 1,
+  "source": "builtin",
+  "status": "verified",
+  "protocol": "socketio",
+  "confidence": 1.0,
+  "event_rules": {
+    "accepted_event_names": ["online", "handCard", "userInfo", "gameInfo", "sitList"],
+    "online_actions": {
+      "gameInfo": "merge_game_info",
+      "actionComplete": "update_common_cards_and_turn",
+      "gameOver": "settlement",
+      "newGame": "reset",
+      "players": "merge_players",
+      "userInfo": "identify_hero",
+      "handCard": "set_private_cards",
+      "sitList": "set_table_identity"
+    },
+    "wrapped_action_path": "data.data.action",
+    "wrapped_payload_path": "data.data.payload",
+    "legacy_event_name_mode": true
+  },
+  "field_mapping": {
+    "phase": "derived:len(commonCard)",
+    "hand": "online.userInfo.handCard",
+    "public_cards": "online.gameInfo.commonCard",
+    "pot": "online.gameInfo.pot",
+    "players": "online.gameInfo.players",
+    "current_player": "online.gameInfo.currPlayer.userId",
+    "previous_bet_size": "online.gameInfo.prevSize",
+    "hero_action_size": "online.gameInfo.players[hero].actionSize",
+    "hero_position": "online.gameInfo.players[hero].type",
+    "showdown": "online.gameOver"
+  },
+  "transforms": {
+    "card_encoding": {
+      "rank": {"a": "2", "b": "3", "c": "4", "d": "5", "e": "6", "f": "7", "g": "8", "h": "9", "i": "T", "j": "J", "k": "Q", "l": "K", "m": "A"},
+      "suit": {"1": "d", "2": "c", "3": "h", "4": "s"}
+    },
+    "position": {"d": "BTN", "sb": "SB", "bb": "BB"}
+  },
+  "state_rules": {
+    "phase": {"source": "public_cards.count", "values": {"0": "PRE_FLOP", "3": "FLOP", "4": "TURN", "5+": "RIVER"}},
+    "to_call": "max(0, previous_bet_size - hero_action_size)",
+    "action_history_dedupe": ["userId", "phase", "actionCommand"],
+    "settlement": "extract_winner_and_showdown_from_allPlayers",
+    "new_hand": "online.newGame"
+  },
+  "evidence": [
+    "内置于旧版 GameStateAggregator 的已验证 Socket.IO 解析规则"
+  ],
+  "ambiguities": [],
+  "metadata": {
+    "executor": "legacy_socketio_aggregator",
+    "sample_for_verification": true
+  }
+}

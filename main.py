@@ -17,7 +17,8 @@ from utils.config_manager import Config
 from utils.logger import setup_logger
 from server.multi_memory import MultiOpponentMemory
 from server.decision import PokerDecision
-from core.gamestate import GameState
+from server.agent_orchestrator import AgentOrchestrator
+from core.data_provider import GameDataSnapshot
 from core.adapter import create_adapter
 
 log = setup_logger()
@@ -39,6 +40,7 @@ def main():
         profile_workers=3,
         hand_reader_workers=3,
     )
+    orchestrator = AgentOrchestrator(brain, memory, logger=log)
 
     adapter = create_adapter(cfg)
 
@@ -46,31 +48,29 @@ def main():
     # 决策回调: POST /decide → L3 决策
     # ═══════════════════════════════════════════════════════════
 
-    def on_decide(gs: GameState) -> dict:
+    def on_decide(snapshot: GameDataSnapshot) -> dict:
         try:
-            # 手牌结束 → 终局画像更新
-            if gs.phase.name == "SETTLEMENT" or gs.phase.name == "INIT":
-                for opp_id in memory.get_opponent_ids():
-                    memory.on_hand_end(opp_id)
-                if gs.phase.name == "INIT":
-                    log.info("新对局开始")
+            gs = snapshot.state
+            if not snapshot.is_valid:
+                log.warning(
+                    f"[DataProvider] 映射结果不可用: version={snapshot.mapping_version} "
+                    f"unresolved={snapshot.unresolved_fields}"
+                )
+                return {"action": "check", "amount": 0, "analysis": "invalid game state mapping"}
 
             # 对手动作已由 bridge 通过 /observe 持续上报，此处不再重复路由
             log.info(f"[Memory] {memory.status()}")
 
-            # 等 L1+L2 完成 (超时 5s，用旧缓存兜底)
-            opponent_context = memory.flush_and_wait(timeout=5.0)
-
-            # L3: DecisionAgent (唯一一次 thinking LLM 调用)
-            decision = brain.decide(gs, semantic_history="",
-                                    opponent_analysis=opponent_context)
+            # L1画像 + L2读牌 + L3最终决策统一由编排器消费快照
+            decision = orchestrator.decide(snapshot, timeout=5.0)
 
             log.info(
                 f"[L3] {gs.phase.name} | pos={gs.my_position} | "
                 f"hand={gs.hand} | board={gs.public_cards} | "
                 f"pot={gs.pot} to_call={gs.to_call} | "
                 f"→ {decision.get('action','?').upper()} "
-                f"amt={decision.get('amount')} conf={decision.get('confidence')}"
+                f"amt={decision.get('amount')} conf={decision.get('confidence')} "
+                f"mapping={snapshot.mapping_version}"
             )
 
             return decision
@@ -84,6 +84,10 @@ def main():
     # ═══════════════════════════════════════════════════════════
 
     def on_observe(event: dict):
+        if event.get("event_type") in ("network", "network_batch"):
+            log.debug("收到网络上下文事件")
+            return
+
         # 对手动作实时上报 (bridge 持续推送)
         opp_id = event.get("opp_id", "")
         events = event.get("events", [])
@@ -109,7 +113,7 @@ def main():
     try:
         adapter.run(on_decide)
     finally:
-        memory.shutdown()
+        orchestrator.shutdown()
 
 
 # _route_opponent_actions 保留给纯 API 模式 (无 bridge /observe) 使用

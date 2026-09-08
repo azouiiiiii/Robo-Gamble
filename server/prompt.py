@@ -1,5 +1,6 @@
 # prompt.py
 import os
+import json
 import random
 import yaml
 
@@ -577,6 +578,7 @@ def build_prompt_from_state(gs, eval_data, preflop, odds, semantic_history,
         "outs_detail": eval_data["outs_detail"],
         "pot_odds": odds[0],
         "required_equity": odds[1],
+        "network_context": gs.network_context[-20:],
     }
     return build_poker_prompt(data, semantic_history, opponent_analysis)
 
@@ -604,6 +606,10 @@ def build_poker_prompt(data, semantic_history, opponent_analysis=""):
     hand_assessment = _build_board_and_hand_text(data)
     hard_rules = _build_hard_rules(data)
     strategy_guidance = _build_strategy_guidance(data)
+
+    network_section = ""
+    if data.get("network_context"):
+        network_section = json.dumps(data["network_context"][-20:], ensure_ascii=False)[:12000]
 
     opponent_section = ""
     if opponent_analysis:
@@ -640,7 +646,10 @@ def build_poker_prompt(data, semantic_history, opponent_analysis=""):
 ### 4. 对手分析:
 {opponent_section if opponent_section else "暂无对手数据。"}
 
-### 5. 硬性约束 (绝对不可违反):
+### 5. 最近页面网络上下文:
+{network_section if network_section else "暂无网络上下文。"}
+
+### 6. 硬性约束 (绝对不可违反):
 {hard_rules if hard_rules else "无特殊约束，自由决策。"}
 
 ### 6. 策略引导 (遵循这些原则):

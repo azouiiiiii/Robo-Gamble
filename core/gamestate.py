@@ -45,6 +45,7 @@ class GameState:
     showdown: Optional[Dict] = None                      # 结算时的摊牌信息
     table_id: str = ""                                   # 牌桌标识，用于跨牌局记忆
     round_id: str = ""                                   # 当前局标识
+    network_context: List[Dict] = field(default_factory=list)
 
     @property
     def is_check(self) -> bool:

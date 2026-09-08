@@ -3,6 +3,7 @@ import json
 from openai import OpenAI
 from server.prompt import build_poker_prompt, build_prompt_from_state, build_opponent_prompt
 from server.evaluator import preflop_hand_strength, evaluate_hand, pot_odds_analysis
+from core.data_provider import GameDataSnapshot
 
 
 class PokerDecision:
@@ -49,11 +50,17 @@ class PokerDecision:
     # Agent 2: DecisionAgent — 综合决策（深模型，启用思考）
     # ═══════════════════════════════════════════════════════════
 
-    def decide(self, gs, semantic_history="", opponent_analysis=None):
+    def decide(self, snapshot, semantic_history="", opponent_analysis=None):
         """
         DecisionAgent: 综合游戏状态 + 对手分析 + 策略约束，输出最终决策。
         使用深度模型，启用 thinking。
         """
+        # 统一数据入口：新调用方传入快照；保留 GameState 兼容旧调用方。
+        if isinstance(snapshot, GameDataSnapshot):
+            gs = snapshot.state
+        else:
+            gs = snapshot
+
         eval_data = evaluate_hand(gs.hand, gs.public_cards)
         preflop = preflop_hand_strength(gs.hand)
         odds = pot_odds_analysis(gs.pot, gs.to_call)

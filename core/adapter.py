@@ -6,13 +6,16 @@
 """
 
 import json
+import queue
 import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Callable
 
 import requests
 
 from core.gamestate import GameState, GamePhase, OpponentAction
+from core.data_provider import HttpGameDataProvider, GameDataSnapshot
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -90,8 +93,10 @@ class GameStateParser:
             my_position=self._get("my_position", raw, ""),
             opponent_actions=actions,
             opponent_chips=self._get("opponent_chips", raw, 0),
+            showdown=self._get("showdown", raw, None),
             table_id=str(self._get("table_id", raw, "")),
             round_id=str(self._get("round_id", raw, "")),
+            network_context=self._get("network_context", raw, []),
         )
 
     def _get(self, internal_name: str, raw: dict, default):
@@ -161,18 +166,52 @@ class HttpServerAdapter:
 
         field_map = config.get("platform.field_map", {})
         self.parser = GameStateParser(field_map)
+        self.data_provider = HttpGameDataProvider(self.parser)
 
         action_cfg = config.get("platform.action_api", {})
         self.executor = ActionExecutor(action_cfg)
 
         self._on_decide: Optional[Callable] = None
         self._on_observe: Optional[Callable] = None
-        self._server: Optional[HTTPServer] = None
+        self._on_network: Optional[Callable] = None
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._observe_queue = queue.Queue(maxsize=int(sc.get("observe_queue_size", 500)))
+        self._observe_worker: Optional[threading.Thread] = None
+        self._stopping = threading.Event()
 
     def set_observe_handler(self, handler: Callable[[dict], None]):
         self._on_observe = handler
 
-    def run(self, on_decide: Callable[[GameState], dict]):
+    def set_network_handler(self, handler: Callable[[dict], None]):
+        self._on_network = handler
+
+    def _start_observe_worker(self):
+        def work():
+            while not self._stopping.is_set():
+                try:
+                    event = self._observe_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    handler = self._on_network if event.get("event_type") in ("network", "network_batch") else self._on_observe
+                    if handler:
+                        handler(event)
+                except Exception:
+                    pass
+                finally:
+                    self._observe_queue.task_done()
+
+        self._observe_worker = threading.Thread(target=work, daemon=True)
+        self._observe_worker.start()
+
+    def _enqueue_observe(self, event: dict) -> bool:
+        try:
+            self._observe_queue.put_nowait(event)
+            return True
+        except queue.Full:
+            return False
+
+    def run(self, on_decide: Callable[[GameDataSnapshot], dict]):
         """启动 HTTP 服务器（阻塞）"""
         self._on_decide = on_decide
         adapter = self
@@ -198,13 +237,14 @@ class HttpServerAdapter:
                 try:
                     body = self._read_body()
                     raw = json.loads(body)
-                    gs = adapter.parser.parse(raw)
+                    snapshots = adapter.data_provider.feed(raw)
+                    snapshot = snapshots[-1]
 
                     if adapter._on_decide is None:
                         self._send_json(500, {"error": "engine not ready"})
                         return
 
-                    decision = adapter._on_decide(gs)
+                    decision = adapter._on_decide(snapshot)
                     adapter.executor.execute(decision)
                     self._send_json(200, decision)
 
@@ -217,9 +257,10 @@ class HttpServerAdapter:
                 try:
                     body = self._read_body()
                     event = json.loads(body)
-                    if adapter._on_observe:
-                        adapter._on_observe(event)
-                    self._send_json(200, {"status": "observed"})
+                    if adapter._enqueue_observe(event):
+                        self._send_json(202, {"status": "queued"})
+                    else:
+                        self._send_json(503, {"error": "observe queue full"})
                 except json.JSONDecodeError:
                     self._send_json(400, {"error": "invalid JSON"})
 
@@ -241,7 +282,8 @@ class HttpServerAdapter:
             def log_message(self, format, *args):
                 pass
 
-        self._server = HTTPServer((self.host, self.port), _Handler)
+        self._server = ThreadingHTTPServer((self.host, self.port), _Handler)
+        self._start_observe_worker()
         print(f"[Adapter] HTTP 服务器启动: http://{self.host}:{self.port}")
         print(f"[Adapter] 决策端点: POST /decide")
         print(f"[Adapter] 观察端点: POST /observe")
@@ -252,6 +294,7 @@ class HttpServerAdapter:
             pass
 
     def stop(self):
+        self._stopping.set()
         if self._server:
             self._server.shutdown()
 

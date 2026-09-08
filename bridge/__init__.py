@@ -5,6 +5,7 @@
 
 from .protocol import parse_socketio_frame
 from .aggregator import GamePhase, GameStateAggregator
+from .data_provider import LegacyWebSocketDataProvider, ProfileGameDataProvider
 from .interceptor import WebSocketInterceptor
 from .browser import (
     try_connect_existing,
@@ -13,3 +14,5 @@ from .browser import (
     CDP_PORT,
     DEFAULT_GAME_URL,
 )
+from .hand_segments import HandBoundary, HandSegment, HandSegmenter, SegmentEventRef
+from .learning_queue import LearningJob, LearningJobQueue

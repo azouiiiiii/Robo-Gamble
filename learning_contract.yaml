@@ -1,0 +1,355 @@
+version: 1
+contract_id: profile_aggregator_v1
+
+# 这是未来 ProfileDrivenAggregator 的运行时边界。
+runtime:
+  input: raw_network_event_v2
+  context:
+    - hero_id
+    - previous_state
+    - current_event
+  output: canonical_game_state_v1
+  output_fields:
+    - phase
+    - hand
+    - public_cards
+    - pot
+    - my_chips
+    - to_call
+    - my_position
+    - opponent_actions
+    - opponent_chips
+    - network_context
+
+analysis_guidance:
+  order:
+    - identify_lifecycle_scenario
+    - compare_before_after_state
+    - test_candidate_mapping_against_shape
+    - emit_only_supported_profile_rules
+  rules:
+    - "Do not map a field by name or frequency alone. Verify its value shape and lifecycle behavior."
+    - "A lifecycle scenario may be inferred from a state transition; it does not require a named network event."
+    - "Raw fields, event labels, runtime state, and derived output fields are different namespaces."
+    - "If a candidate is not proven, mark it not_observed or ambiguous instead of inventing a mapping."
+    - "Use at least two distinct observations for a direct mapping when the input contains them."
+
+scenarios:
+  lifecycle:
+    order:
+      - hand_start
+      - preflop
+      - flop
+      - turn
+      - river
+      - settlement
+      - next_hand
+  hand_start:
+    purpose: "A new hand begins or private cards are dealt."
+    candidate_signals:
+      - phase_becomes: PRE_FLOP
+      - private_cards_appear: true
+      - hand_identifier_changes: true
+    effects:
+      - reset_previous_state
+      - capture: [hand, players, current_player]
+  street_transition:
+    purpose: "The active hand advances to another betting street."
+    candidate_signals:
+      - phase_changes: true
+      - public_card_count_increases: true
+    effects:
+      - merge_state_patch
+      - capture: [phase, public_cards, pot, players, current_player]
+  action_observation:
+    purpose: "A player action is explicit or inferred from a state delta."
+    candidate_signals:
+      - explicit_action_event: true
+      - player_contribution_changes: true
+      - current_player_changes: true
+    effects:
+      - append_action_history
+  settlement:
+    purpose: "The active hand reaches a terminal result."
+    candidate_signals:
+      - terminal_phase: true
+      - result_object_appears: true
+      - showdown_cards_appear: true
+    effects:
+      - derive: showdown
+      - close_hand
+  next_hand:
+    purpose: "A completed hand is followed by a fresh hand."
+    candidate_signals:
+      - previous_phase: SETTLEMENT
+      - current_phase: PRE_FLOP
+      - hand_identifier_changes: true
+      - private_cards_change: true
+    effects:
+      - reset_state
+
+targets:
+  phase:
+    expected_values: [PRE_FLOP, FLOP, TURN, RIVER, SETTLEMENT]
+    expected_order: [PRE_FLOP, FLOP, TURN, RIVER, SETTLEMENT]
+    resets_after: [SETTLEMENT]
+  hand:
+    expected_shape: list_of_card_values
+    appears_during: [hand_start]
+    stable_until: [settlement]
+    changes_during: [next_hand]
+    must_not_be: [hand_identifier]
+  public_cards:
+    expected_count:
+      PRE_FLOP: 0
+      FLOP: 3
+      TURN: 4
+      RIVER: 5
+    invariant: non_decreasing_within_active_hand
+  pot:
+    invariant: non_decreasing_while_hand_active
+    reset_allowed_at: [settlement, next_hand]
+    note: "The raw source may omit pot or reset it at settlement; validate within the active-hand scope."
+  current_player:
+    changes_during: [action_observation, street_transition]
+    may_be_null_during: [settlement]
+  previous_bet_size:
+    scope: current_betting_street
+  hero_action_size:
+    scope: current_betting_street
+    requires_context: [hero_id]
+  game_result:
+    expected_during: [settlement]
+    absent_or_empty_during: [hand_start, preflop, flop, turn, river]
+  showdown:
+    optional: true
+    derived_from: [game_result, revealed_private_cards, players]
+    produced_during: [settlement]
+
+evidence_policy:
+  direct_mapping:
+    min_distinct_events: 2
+  derived_state:
+    require_before_after_transition: true
+  uncertain_semantics:
+    allowed_status: [supported, not_observed, ambiguous, conflict]
+
+profile:
+  required:
+    - protocol
+    - event_rules
+    - field_mapping
+    - transforms
+    - state_rules
+  required_field_mapping:
+    - phase
+    - hand
+    - public_cards
+    - pot
+    - players
+    - current_player
+    - previous_bet_size
+    - hero_action_size
+    - hero_position
+  required_state_rules:
+    - phase
+    - to_call
+    - action_history
+    - new_hand
+    - settlement
+    - state_merge
+
+field_mapping:
+  allowed:
+    - phase
+    - hand
+    - public_cards
+    - pot
+    - players
+    - current_player
+    - previous_bet_size
+    - hero_action_size
+    - hero_position
+    - showdown
+
+state_rules:
+  allowed:
+    - phase
+    - to_call
+    - action_history
+    - new_hand
+    - settlement
+    - state_merge
+  allowed_ops:
+    - identity
+    - map_enum
+    - subtract_clamped
+    - build_action_history
+    - reset
+    - extract_showdown
+    - merge_patch
+
+transforms:
+  allowed_kinds:
+    - builtin
+    - enum
+    - card_encoding
+    - number
+    - player_lookup
+    - list_filter
+
+event_rules:
+  allowed_match_keys:
+    - all
+    - any
+    - event_type
+    - stream_type
+    - direction
+    - kind
+    - event_name
+    - payload_path
+    - payload_equals
+  allowed_emits:
+    - state_patch
+    - action
+    - new_hand
+    - settlement
+
+schemas:
+  profile:
+    type: object
+    additionalProperties: false
+    required:
+      - profile_id
+      - version
+      - source
+      - status
+      - protocol
+      - event_rules
+      - field_mapping
+      - transforms
+      - state_rules
+      - confidence
+    properties:
+      profile_id:
+        type: string
+        minLength: 1
+      version:
+        type: integer
+        minimum: 1
+      source:
+        type: string
+        enum: [learned, builtin]
+      status:
+        type: string
+        enum: [draft, candidate, verified, builtin]
+      protocol:
+        type: string
+        minLength: 1
+      host:
+        type: string
+      confidence:
+        type: number
+        minimum: 0
+        maximum: 1
+      event_rules:
+        $ref: '#/$defs/event_rules'
+      field_mapping:
+        type: object
+        minProperties: 1
+        additionalProperties:
+          $ref: '#/$defs/field_mapping_entry'
+      transforms:
+        type: object
+        additionalProperties:
+          $ref: '#/$defs/transform_entry'
+      state_rules:
+        type: object
+        minProperties: 1
+        additionalProperties:
+          $ref: '#/$defs/state_rule_entry'
+      evidence:
+        type: array
+      ambiguities:
+        type: array
+      validations:
+        type: array
+      metadata:
+        type: object
+      updated_at:
+        type: string
+    $defs:
+      event_rules:
+        type: object
+        minProperties: 1
+        additionalProperties:
+          type: object
+          additionalProperties: false
+          required: [match, emits]
+          properties:
+            match:
+              type: object
+              minProperties: 1
+            emits:
+              type: string
+              enum: [state_patch, action, new_hand, settlement]
+            priority:
+              type: integer
+              minimum: 0
+            evidence:
+              type: array
+      field_mapping_entry:
+        type: object
+        additionalProperties: false
+        required: [source]
+        properties:
+          source:
+            type: object
+            additionalProperties: false
+            required: [event_rule, path]
+            properties:
+              event_rule:
+                type: string
+                minLength: 1
+              path:
+                type: string
+                minLength: 1
+          transform:
+            type: string
+            minLength: 1
+          evidence:
+            type: array
+      transform_entry:
+        type: object
+        additionalProperties: false
+        required: [kind]
+        properties:
+          kind:
+            type: string
+            enum: [builtin, enum, card_encoding, number, player_lookup, list_filter]
+          name:
+            type: string
+          params:
+            type: object
+          evidence:
+            type: array
+      state_rule_entry:
+        type: object
+        additionalProperties: false
+        required: [op]
+        properties:
+          op:
+            type: string
+            enum: [identity, map_enum, subtract_clamped, build_action_history, reset, extract_showdown, merge_patch]
+          source:
+            type: string
+          args:
+            type: array
+            items:
+              type: string
+          event_rule:
+            type: string
+          params:
+            type: object
+          evidence:
+            type: array

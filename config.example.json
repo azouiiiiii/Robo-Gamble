@@ -34,7 +34,58 @@
         "game_url": "http://localhost:7001",
         "auto_mode": false,
         "headless": false,
-        "suggestion_timeout": 5000
+        "suggestion_timeout": 5000,
+        "mode": "verify",
+        "mapping_profile": "legacy_socketio_v1",
+        "network_capture": {
+            "enabled": true,
+            "resource_types": ["fetch", "xhr"],
+            "content_types": ["application/json", "text/"],
+            "capture_request": false,
+            "capture_response": true,
+            "capture_failed": true,
+            "capture_request_headers": true,
+            "capture_response_headers": true,
+            "capture_request_body": false,
+            "max_body_bytes": 65536,
+            "max_queue_size": 500,
+            "batch_size": 20,
+            "flush_interval_ms": 200,
+            "send_timeout_seconds": 5,
+            "redact_headers": [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "x-auth-token",
+                "x-csrf-token"
+            ]
+        }
+    },
+    "learning": {
+        "profile_dir": "profiles",
+        "contract_path": "learning_contract.yaml",
+        "session_dir": "learning_sessions",
+        "model": "deepseek-v4-flash",
+        "max_prompt_chars": 100000,
+        "request_timeout_seconds": 180,
+        "max_output_tokens": 0,
+        "input_compression": {
+            "enabled": true,
+            "compress_repeated_frames": true,
+            "exclude_url_patterns": [
+                "(?:^|://)(?:www\\.)?google-analytics\\.com/",
+                "(?:^|://)cdn\\.[^/]+/[^?#]+\\.(?:mp3|wav|ogg|m4a|png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|css)(?:[?#]|$)"
+            ]
+        },
+        "boundary_key": "backquote",
+        "overlap_ms": 1000,
+        "analyze_on_boundary": true,
+        "job_queue_size": 20,
+        "worker_count": 1,
+        "auto_learn": true,
+        "allow_auto_decision_with_profile": false
     },
     "ai": {
         "model": "deepseek-v4-flash",
