@@ -4,7 +4,7 @@
 启动: python main.py → HTTP 服务器监听
 
 三层流水线:
-  1. L1 Profile Workers (x3)   — 对手画像 (on_opponent_action + hand_end 触发)
+  1. L1 Opponent Profile Workers (x3) — 对手画像 (on_opponent_action + hand_end 触发)
   2. L2 Hand Reader Workers (x3) — 对手读牌 (on_opponent_action 触发)
   3. L3 DecisionAgent          — 等 L1+L2 完成后整合 prompt, 开 thinking 决策
 
@@ -53,10 +53,10 @@ def main():
             gs = snapshot.state
             if not snapshot.is_valid:
                 log.warning(
-                    f"[DataProvider] 映射结果不可用: version={snapshot.mapping_version} "
+                    f"[DataProvider] 解析结果不可用: version={snapshot.provider_version} "
                     f"unresolved={snapshot.unresolved_fields}"
                 )
-                return {"action": "check", "amount": 0, "analysis": "invalid game state mapping"}
+                return {"action": "check", "amount": 0, "analysis": "invalid game state input"}
 
             # 对手动作已由 bridge 通过 /observe 持续上报，此处不再重复路由
             log.info(f"[Memory] {memory.status()}")
@@ -70,7 +70,7 @@ def main():
                 f"pot={gs.pot} to_call={gs.to_call} | "
                 f"→ {decision.get('action','?').upper()} "
                 f"amt={decision.get('amount')} conf={decision.get('confidence')} "
-                f"mapping={snapshot.mapping_version}"
+                f"provider={snapshot.provider_version}"
             )
 
             return decision

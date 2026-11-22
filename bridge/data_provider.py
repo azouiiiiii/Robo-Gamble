@@ -1,16 +1,11 @@
-"""Bridge 侧数据 Provider。
-
-这里暂时包装现有的硬编码聚合器，作为兼容实现。后续只需替换为基于
-站点 Profile 的 Provider，Interceptor 和 Agent 编排层无需感知差异。
-"""
+"""Socket.IO 站点聚合器到统一 GameDataSnapshot 的适配层。"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Optional
 
 from core.adapter import GameStateParser
 from core.data_provider import GameDataSnapshot
-from core.mapping_profile import MappingProfile, MappingProfileRegistry
 
 from .aggregator import GamePhase, GameStateAggregator
 
@@ -32,39 +27,16 @@ _LEGACY_FIELD_MAP = {
 }
 
 
-class ProfileGameDataProvider:
-    """由 MappingProfile 驱动的统一 Provider。
+class SocketIOGameDataProvider:
+    """将逐条 Socket.IO 事件送入站点聚合器并输出统一快照。"""
 
-    当前只实现内置 legacy Socket.IO Profile 的执行器；后续学习 Profile
-    使用相同接口接入，不需要改动上层 Interceptor 或 Agent 编排。
-    """
+    provider_version = "socketio-site-aggregator-v1"
 
-    def __init__(self, profile: MappingProfile, my_user_id: str, verbose: bool = False):
-        if profile.metadata.get("executor") != "legacy_socketio_aggregator":
-            raise NotImplementedError(
-                f"no executor for mapping profile: {profile.profile_id}"
-            )
-        self.profile = profile
+    def __init__(self, my_user_id: str, verbose: bool = False):
         self._my_user_id = my_user_id
-        self._verbose = verbose
-        self._parser = GameStateParser(_LEGACY_FIELD_MAP)
         self.aggregator = GameStateAggregator(my_user_id, verbose=verbose)
-        self._snapshot: GameDataSnapshot | None = None
-
-    @classmethod
-    def from_registry(
-        cls,
-        profile_id: str,
-        my_user_id: str,
-        verbose: bool = False,
-        profile_dir: str = "profiles",
-    ) -> "ProfileGameDataProvider":
-        profile = MappingProfileRegistry(profile_dir).load(profile_id)
-        return cls(profile, my_user_id, verbose=verbose)
-
-    @property
-    def mapping_version(self) -> str:
-        return self.profile.mapping_version
+        self._parser = GameStateParser(_LEGACY_FIELD_MAP)
+        self._snapshot: Optional[GameDataSnapshot] = None
 
     @property
     def my_user_id(self) -> str:
@@ -87,45 +59,34 @@ class ProfileGameDataProvider:
         return self.aggregator.phase
 
     def feed(self, event: dict) -> list[GameDataSnapshot]:
-        self.aggregator.feed(event)
-        raw = self.aggregator.build_game_state()
-        state = self._parser.parse(raw)
-        self._snapshot = GameDataSnapshot(
-            state=state,
-            raw=raw,
-            source_events=[event],
-            mapping_version=self.mapping_version,
-            confidence=1.0,
-            source_kind="websocket",
-            actions_already_observed=True,
+        """应用共享解码事件；兼容直接传入旧版协议包。"""
+        packet = (
+            event.get("packet")
+            if event.get("event_type") == "decoded_socketio_event"
+            else event
         )
+        if isinstance(packet, dict):
+            self.aggregator.feed(packet)
+        self._snapshot = self._build_snapshot(event)
         return [self._snapshot]
 
-    def current_snapshot(self) -> GameDataSnapshot | None:
+    def current_snapshot(self) -> Optional[GameDataSnapshot]:
         if self._snapshot is None:
-            raw = self.aggregator.build_game_state()
-            state = self._parser.parse(raw)
-            self._snapshot = GameDataSnapshot(
-                state=state,
-                raw=raw,
-                mapping_version=self.mapping_version,
-                confidence=1.0,
-                source_kind="websocket",
-                actions_already_observed=True,
-            )
+            self._snapshot = self._build_snapshot()
         return self._snapshot
 
     def reset(self) -> None:
         self.aggregator.reset()
         self._snapshot = None
 
-
-class LegacyWebSocketDataProvider(ProfileGameDataProvider):
-    """兼容入口：加载内置 legacy_socketio_v1 Profile。"""
-
-    def __init__(self, my_user_id: str, verbose: bool = False, profile_dir: str = "profiles"):
-        super().__init__(
-            MappingProfileRegistry(profile_dir).load("legacy_socketio_v1"),
-            my_user_id,
-            verbose=verbose,
+    def _build_snapshot(self, event: dict | None = None) -> GameDataSnapshot:
+        raw = self.aggregator.build_game_state()
+        state = self._parser.parse(raw)
+        return GameDataSnapshot(
+            state=state,
+            raw=raw,
+            source_events=[event] if event else [],
+            provider_version=self.provider_version,
+            source_kind="websocket",
+            actions_already_observed=True,
         )

@@ -10,16 +10,15 @@ from typing import Optional
 import requests
 from playwright.async_api import Page, WebSocket
 
-from .protocol import parse_socketio_frame
+from .protocol import decode_socketio_frame_event
 from .aggregator import GamePhase
-from .data_provider import ProfileGameDataProvider
+from .data_provider import SocketIOGameDataProvider
 from .network import PageNetworkCollector
-from .learning import NetworkDecisionContext, create_learning_agent
-from .learning import LearningSessionRecorder
+from .network_context import NetworkEventContext
+from .network_events import NetworkEventSequencer
+from .session_recorder import SessionRecorder
 from .hand_segments import HandBoundary, HandSegment, HandSegmenter
-from .learning_queue import LearningJob, LearningJobQueue
 from .boundary_listener import BoundaryListener
-from core.mapping_profile import MappingProfileRegistry
 from .modes import BridgeMode, normalize_mode
 
 
@@ -31,81 +30,49 @@ class WebSocketInterceptor:
 
     def __init__(self, agent_url: str = "http://localhost:8765", verbose: bool = False,
                  network_config: Optional[dict] = None,
-                 profile_id: str = "legacy_socketio_v1",
-                 profile_dir: str = "profiles",
                  mode: str | BridgeMode = BridgeMode.VERIFY,
-                 learning_session_dir: str = "learning_sessions",
-                 learning_config: Optional[dict] = None,
-                 learning_handler=None):
+                 session_dir: str = "learning_sessions",
+                 capture_config: Optional[dict] = None):
         self.agent_url = agent_url
         self.mode = normalize_mode(mode)
-        self.profile_id = profile_id
-        self.profile_dir = profile_dir
-        self.learning_session_dir = learning_session_dir
-        self.learning_config = dict(learning_config or {})
-        if self.mode != BridgeMode.LEARN:
-            profile = MappingProfileRegistry(profile_dir).load(profile_id)
-            if self.mode == BridgeMode.AUTO and not profile.is_usable:
-                raise ValueError(
-                    f"自动模式只允许 builtin/verified Profile: {profile.mapping_version}"
-                )
-            if self.mode == BridgeMode.VERIFY and profile.status == "draft":
-                raise ValueError(
-                    f"验证模式不能加载 draft Profile: {profile.mapping_version}"
-                )
-        self.data_provider: Optional[ProfileGameDataProvider] = None
+        self.session_dir = session_dir
+        self.capture_config = dict(capture_config or {})
+        self.data_provider: Optional[SocketIOGameDataProvider] = None
         self.auto_mode: bool = self.mode == BridgeMode.AUTO
         self.verbose: bool = verbose
         self._page: Optional[Page] = None
         self._loop = asyncio.get_event_loop()
         self.recorder = None
         self.segmenter = None
-        self.learning_queue = None
         self.boundary_listener = None
         if self.mode == BridgeMode.LEARN:
             self.segmenter = HandSegmenter(
-                overlap_ms=int(self.learning_config.get("overlap_ms", 1000)),
-                on_boundary=self._on_learning_boundary,
-                on_segment=self._on_learning_segment,
+                overlap_ms=int(self.capture_config.get("overlap_ms", 1000)),
+                on_boundary=self._on_capture_boundary,
+                on_segment=self._on_captured_segment,
             )
-            self.recorder = LearningSessionRecorder(
-                learning_session_dir, on_event=self.segmenter.add_event
-            )
-            if learning_handler is None:
-                try:
-                    from utils.config_manager import Config
-                    learning_agent = create_learning_agent(
-                        Config("config.json"), verbose=verbose
-                    )
-                    learning_handler = self._record_learning_outcome(learning_agent)
-                except (FileNotFoundError, ImportError, RuntimeError, ValueError) as exc:
-                    learning_handler = self._record_learning_outcome(
-                        self._unavailable_learning_handler(exc, verbose)
-                    )
-            else:
-                learning_handler = self._record_learning_outcome(learning_handler)
-            self.learning_queue = LearningJobQueue(
-                handler=learning_handler,
-                max_queue_size=int(self.learning_config.get("job_queue_size", 20)),
-                worker_count=int(self.learning_config.get("worker_count", 1)),
+            self.recorder = SessionRecorder(
+                session_dir, on_event=self.segmenter.add_event
             )
             self.boundary_listener = BoundaryListener(
-                self._mark_learning_boundary,
-                key=str(self.learning_config.get("boundary_key", "backquote")),
+                self._mark_capture_boundary,
+                key=str(self.capture_config.get("boundary_key", "backquote")),
                 verbose=verbose,
             )
         effective_network_config = dict(network_config or {})
         if self.mode == BridgeMode.LEARN:
-            # 学习阶段需要请求与响应的关联；不改变调用方传入的原 dict。
+            # 采集阶段需要请求与响应的关联；不改变调用方传入的原 dict。
             effective_network_config["capture_request"] = True
             effective_network_config["capture_request_body"] = bool(
                 effective_network_config.get("capture_request_body", False)
             )
-        self.network_context = NetworkDecisionContext(recorder=self.recorder)
+        self.network_context = NetworkEventContext(recorder=self.recorder)
+        self._network_sequencer = NetworkEventSequencer()
         self._network = PageNetworkCollector(
             agent_url, effective_network_config, verbose=verbose,
             on_event=self.network_context.observe,
             send_enabled=self.mode == BridgeMode.AUTO,
+            sequencer=self._network_sequencer,
         )
         self._last_decision: Optional[dict] = None
         self._decision_count: int = 0
@@ -116,7 +83,7 @@ class WebSocketInterceptor:
         self._last_observed_count: int = 0    # 已上报的 action_history 数量
         self._hand_id: int = 0                # 当前局号, 新局+1, 防旧决策打到新局
         self._last_verify_key: Optional[str] = None
-        self._last_learning_boundary_ns = 0
+        self._last_capture_boundary_ns = 0
 
     async def attach(self, page: Page, auto_mode: Optional[bool] = None):
         self._page = page
@@ -139,7 +106,7 @@ class WebSocketInterceptor:
         if self.mode == BridgeMode.LEARN:
             try:
                 await page.expose_binding(
-                    "__pokerLearningBoundary", self._on_page_boundary
+                    "__pokerCaptureBoundary", self._on_page_boundary
                 )
                 await page.add_init_script("""
                     (() => {
@@ -147,49 +114,61 @@ class WebSocketInterceptor:
                             if (event.code !== 'Backquote' || event.repeat) return;
                             event.preventDefault();
                             event.stopPropagation();
-                            if (typeof window.__pokerLearningBoundary === 'function') {
-                                window.__pokerLearningBoundary('page_backquote');
+                            if (typeof window.__pokerCaptureBoundary === 'function') {
+                                window.__pokerCaptureBoundary('page_backquote');
                             }
                         }, true);
                     })();
                 """)
-                print("[Learn] 已监听页面反引号键 ` / ~（页面聚焦时可用）")
+                print("[Capture] 已监听页面反引号键 ` / ~（页面聚焦时可用）")
             except Exception as exc:
-                print(f"[Learn] 页面反引号监听不可用: {exc}")
+                print(f"[Capture] 页面反引号监听不可用: {exc}")
         if self.boundary_listener and self.boundary_listener.start():
-            print("[Learn] 已监听反引号键 ` / ~，按键切分牌局")
+            print("[Capture] 已监听反引号键 ` / ~，按键切分牌局")
 
     async def close(self):
         if self.boundary_listener:
             self.boundary_listener.stop()
         if self.segmenter:
-            self.segmenter.close()
-        if self.learning_queue:
-            self.learning_queue.close(wait=True)
+            final_segment = self.segmenter.close()
+            self._on_captured_segment(final_segment)
         await self._network.close()
         if self.recorder:
             self.recorder.close()
 
     def _on_frame(self, _direction: str, frame, _ws: WebSocket, connection_id: str = ""):
-        payload = frame if isinstance(frame, str) else getattr(frame, 'payload', str(frame))
+        if isinstance(frame, (str, bytes)):
+            payload = frame
+        else:
+            payload = getattr(frame, 'payload', str(frame))
         if not payload:
             return
 
-        if self.recorder:
-            self.recorder.record_websocket(
-                direction=_direction,
-                url=getattr(_ws, "url", ""),
-                payload=payload,
-                connection_id=connection_id or "unknown",
-            )
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="replace")
+        elif not isinstance(payload, str):
+            payload = str(payload)
 
-        # 学习模式只记录原始帧，不解析、不加载固定映射、不触发任何决策。
+        frame_event = self._network_sequencer.emit(
+            kind="frame",
+            stream_id=f"websocket:{connection_id or 'unknown'}",
+            stream_type="websocket",
+            connection_id=connection_id or "unknown",
+            direction=_direction,
+            payload=payload,
+            metadata={"url": getattr(_ws, "url", "")},
+        )
+        if self.recorder:
+            self.recorder.record_event(frame_event)
+
+        # learn 模式只记录原始帧，不运行解释器或触发决策。
         if self.mode == BridgeMode.LEARN:
             if self.verbose:
-                print(f"[Learn] 已记录 WebSocket {_direction} 帧 ({len(payload)} bytes)")
+                print(f"[Capture] 已记录 WebSocket {_direction} 帧 ({len(payload)} bytes)")
             return
 
-        parsed = parse_socketio_frame(payload)
+        decoded_event = decode_socketio_frame_event(frame_event)
+        parsed = decoded_event["packet"]
         if parsed is None:
             return
 
@@ -212,12 +191,6 @@ class WebSocketInterceptor:
                 tag = "📦" if _has_wrapped else "←"
                 print(f"[Bridge] {tag} {ename} | {data_preview}")
 
-        # 过滤非游戏事件（允许 parseMsg 包装格式，其事件名是 socket ID）
-        if etype == "event" and ename not in ("online", "handCard", "userInfo", "gameInfo", "sitList") and not _has_wrapped:
-            if self.verbose:
-                print(f"[Bridge] ⏭ 跳过非游戏事件: {ename}")
-            return
-
         if etype == "connect":
             sid = parsed.get("sid", "?")
             print(f"[Bridge] 🔌 socket.io 已连接 (sid={sid})")
@@ -236,7 +209,7 @@ class WebSocketInterceptor:
         if etype == "event":
             if self.data_provider:
                 was_settlement = self.data_provider.phase == GamePhase.SETTLEMENT
-                self.data_provider.feed(parsed)
+                self.data_provider.feed(decoded_event)
                 if self.mode == BridgeMode.VERIFY:
                     self._show_verification_snapshot()
                 else:
@@ -252,11 +225,10 @@ class WebSocketInterceptor:
                 uid = self._extract_user_id(parsed)
                 if uid:
                     print(f"[Bridge] 👤 识别玩家 userId={uid}")
-                    self.data_provider = ProfileGameDataProvider.from_registry(
-                        self.profile_id, uid, verbose=self.verbose,
-                        profile_dir=self.profile_dir,
+                    self.data_provider = SocketIOGameDataProvider(
+                        uid, verbose=self.verbose
                     )
-                    self.data_provider.feed(parsed)
+                    self.data_provider.feed(decoded_event)
                     if self.mode == BridgeMode.VERIFY:
                         self._show_verification_snapshot()
                     else:
@@ -266,91 +238,32 @@ class WebSocketInterceptor:
                     print("[Bridge] ⚠️ 收到游戏数据但尚未识别用户，等待 userInfo...")
 
     def _on_page_boundary(self, _source, key: str = "page_backquote"):
-        self._mark_learning_boundary(key)
+        self._mark_capture_boundary(key)
 
-    def _mark_learning_boundary(self, key: str = "backquote"):
+    def _mark_capture_boundary(self, key: str = "backquote"):
         if not self.segmenter:
             return
         now = time.monotonic_ns()
-        if now - self._last_learning_boundary_ns < 300_000_000:
+        if now - self._last_capture_boundary_ns < 300_000_000:
             return
-        self._last_learning_boundary_ns = now
+        self._last_capture_boundary_ns = now
         try:
             boundary = self.segmenter.mark_boundary(key)
             if self.verbose:
-                print(f"[Learn] 🏁 {boundary.boundary_id}, overlap={boundary.overlap_ms}ms")
+                print(f"[Capture] 🏁 {boundary.boundary_id}, overlap={boundary.overlap_ms}ms")
         except Exception as exc:
             if self.verbose:
-                print(f"[Learn] 边界处理失败: {exc}")
+                print(f"[Capture] 边界处理失败: {exc}")
 
-    def _on_learning_boundary(self, boundary: HandBoundary):
+    def _on_capture_boundary(self, boundary: HandBoundary):
         if self.recorder:
             self.recorder.record_boundary(boundary.to_dict())
 
-    def _on_learning_segment(self, segment: HandSegment):
+    def _on_captured_segment(self, segment: HandSegment):
         if self.recorder:
             self.recorder.record_segment(segment.to_dict())
-        if (
-            not self.learning_queue
-            or not self.segmenter
-            or not self.learning_config.get("analyze_on_boundary", True)
-            or not self.learning_config.get("auto_learn", True)
-        ):
-            return
-        job = LearningJob(
-            hand_id=segment.hand_id,
-            segment=segment,
-            # 只复制 ID→原始事件的索引，事件对象本身仍只保留一份。
-            raw_events=dict(self.segmenter.raw_events),
-            source_session_path=str(self.recorder.path) if self.recorder else "",
-        )
-        if self.learning_queue.submit(job) and self.verbose:
-            print(f"[Learn] 已排队 {job.hand_id}: {len(segment.event_refs)} 个事件")
-
-    @staticmethod
-    def _default_learning_handler(job: LearningJob):
-        """兼容旧调用；没有配置 LearningAgent 时保留原始任务并明确失败。"""
-        raise RuntimeError("LearningAgent 未配置")
-
-    def _record_learning_outcome(self, handler):
-        """使采集会话可追溯到异步学习任务与保存的 Profile。"""
-        def run(job: LearningJob):
-            try:
-                result = handler(job)
-            except Exception as exc:
-                if self.recorder:
-                    self.recorder.record_learning_result({
-                        "hand_id": job.hand_id,
-                        "status": "failed",
-                        "error": str(exc),
-                    })
-                raise
-            if self.recorder:
-                mapping_version = (
-                    f"{result.get('profile_id', '')}:v{result.get('version', 1)}"
-                    if isinstance(result, dict)
-                    else getattr(result, "mapping_version", "")
-                )
-                self.recorder.record_learning_result({
-                    "hand_id": job.hand_id,
-                    "status": "completed",
-                    "profile_id": job.result_profile_id,
-                    "profile_path": job.result_path,
-                    "confidence": job.result_confidence,
-                    "mapping_version": mapping_version,
-                })
-            return result
-        return run
-
-    @staticmethod
-    def _unavailable_learning_handler(error: Exception, verbose: bool):
-        if verbose:
-            print(f"[Learn] LearningAgent 不可用: {error}")
-
-        def handler(job: LearningJob):
-            raise RuntimeError(f"LearningAgent 不可用: {error}")
-
-        return handler
+        if self.verbose:
+            print(f"[Capture] 已封存 {segment.hand_id}: {len(segment.event_refs)} 个事件引用")
 
     def _extract_user_id(self, parsed: dict) -> Optional[str]:
         """从多种消息格式中提取 userId"""
@@ -601,7 +514,7 @@ class WebSocketInterceptor:
             self._deciding = False
 
     def _show_verification_snapshot(self):
-        """验证模式：只将当前固定 Profile 的解析结果显示到页面。"""
+        """验证模式：将当前 Socket.IO 聚合结果显示到页面。"""
         if self.mode != BridgeMode.VERIFY or self.data_provider is None:
             return
         snapshot = self.data_provider.current_snapshot()
@@ -616,8 +529,7 @@ class WebSocketInterceptor:
             return
         self._last_verify_key = key
         payload = {
-            "profile": snapshot.mapping_version,
-            "confidence": snapshot.confidence,
+            "provider": snapshot.provider_version,
             "phase": state.phase.value,
             "hand": state.hand,
             "public_cards": state.public_cards,
@@ -638,22 +550,21 @@ class WebSocketInterceptor:
         if not self._page:
             return
         text = (
-            f"Profile: {data['profile']}\\n"
-            f"置信度: {data['confidence']:.0%}\\n"
+            f"解析入口: {data['provider']}\\n"
             f"阶段: {data['phase']}\\n"
             f"手牌: {', '.join(data['hand']) or '-'}\\n"
             f"公共牌: {', '.join(data['public_cards']) or '-'}\\n"
             f"底池: {data['pot']}  跟注: {data['to_call']}\\n"
             f"位置: {data['position'] or '-'}  动作数: {data['actions']}\\n"
-            "[验证模式：未调用 Agent]"
+            "[验证模式：当前 Socket.IO 聚合器；未调用决策 Agent]"
         )
         js_text = json.dumps(text, ensure_ascii=False)
         js = f"""
         (() => {{
-            const old = document.getElementById('mapping-verification');
+            const old = document.getElementById('socketio-verification');
             if (old) old.remove();
             const div = document.createElement('pre');
-            div.id = 'mapping-verification';
+            div.id = 'socketio-verification';
             div.textContent = {js_text};
             div.style.cssText = 'position:fixed;top:10px;left:10px;z-index:99999;'
                 + 'background:rgba(20,20,20,0.9);color:#7dd3fc;padding:12px 16px;'

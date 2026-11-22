@@ -21,7 +21,7 @@ from utils.config_manager import Config
 async def amain():
     parser = argparse.ArgumentParser(description="德州扑克 AI Bridge - CDP WebSocket 拦截")
     parser.add_argument("--mode", choices=[mode.value for mode in BridgeMode],
-                        help="运行模式：learn=学习，verify=验证，auto=自动打牌")
+                        help="运行模式：learn=采集，verify=验证当前解析，auto=自动打牌")
     parser.add_argument("--auto", action="store_true", help="自动模式：Agent 自动执行决策")
     parser.add_argument("--url", type=str, default=DEFAULT_GAME_URL,
                         help=f"游戏页面 URL（默认: {DEFAULT_GAME_URL}）")
@@ -47,23 +47,20 @@ async def amain():
     try:
         cfg = Config("config.json")
         configured_network = cfg.get("bridge.network_capture", {})
-        profile_id = cfg.get("bridge.mapping_profile", "legacy_socketio_v1")
-        profile_dir = cfg.get("learning.profile_dir", "profiles")
         configured_mode = cfg.get("bridge.mode", "verify")
-        learning_session_dir = cfg.get("learning.session_dir", "learning_sessions")
-        learning_config = cfg.get("learning", {})
+        capture_config = cfg.get("bridge.capture", {})
     except FileNotFoundError:
         configured_network = {}
-        profile_id = "legacy_socketio_v1"
-        profile_dir = "profiles"
         configured_mode = "verify"
-        learning_session_dir = "learning_sessions"
-        learning_config = {}
+        capture_config = {}
+
+    capture_config = dict(capture_config or {})
+    session_dir = capture_config.pop("session_dir", "learning_sessions")
 
     mode = normalize_mode("auto" if args.auto else (args.mode or configured_mode))
     labels = {
-        BridgeMode.LEARN: "学习（仅采集）",
-        BridgeMode.VERIFY: "验证（固定 Profile 浮层）",
+        BridgeMode.LEARN: "采集（保存原始网络流）",
+        BridgeMode.VERIFY: "验证（显示当前 Socket.IO 聚合结果）",
         BridgeMode.AUTO: "自动打牌",
     }
     print(f"  运行模式:    {labels[mode]}")
@@ -76,24 +73,24 @@ async def amain():
     # 1. 先尝试连已有 Chrome
     result = await try_connect_existing(
         args.agent, args.auto, args.cdp_port, args.verbose, network_config,
-        profile_id, profile_dir, mode.value, learning_session_dir, learning_config,
+        mode.value, session_dir, capture_config,
     )
 
     # 2. 连不上就拉起新浏览器兜底
     if result is None:
         result = await launch_new(
             args.url, args.agent, args.auto, args.cdp_port, args.verbose, network_config,
-            profile_id, profile_dir, mode.value, learning_session_dir, learning_config,
+            mode.value, session_dir, capture_config,
         )
 
     interceptor, pw, browser, page = result
 
     if mode == BridgeMode.LEARN:
-        print("[Bridge] 学习模式 - 记录原始网络数据，边界后异步学习并保存 draft Profile")
+        print(f"[Bridge] 采集模式 - 记录原始网络数据到 {session_dir}，不运行学习 Agent")
     elif mode == BridgeMode.VERIFY:
-        print(f"[Bridge] 验证模式 - Profile={profile_id}，仅显示映射结果")
+        print("[Bridge] 验证模式 - 使用内置 Socket.IO 聚合器显示当前状态")
     else:
-        print(f"[Bridge] 自动模式 - Profile={profile_id}，Agent 将自动执行决策")
+        print("[Bridge] 自动模式 - 使用内置 Socket.IO 聚合器驱动决策")
 
     print("[Bridge] 运行中，按 Ctrl+C 停止...")
 

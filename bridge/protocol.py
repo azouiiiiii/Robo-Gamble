@@ -74,3 +74,38 @@ def parse_socketio_frame(payload: str) -> Optional[dict]:
         return {"_type": "disconnect"}
 
     return None
+
+
+def decode_socketio_frame_event(frame_event: dict) -> dict:
+    """把原始 WebSocket 帧解码为带来源引用的 Socket.IO 事件。
+
+    ``parse_socketio_frame`` 仍是唯一的线协议解析器。此函数只包装其结果，
+    让实时处理和会话回放得到相同结构，并保留回到原始帧的 ID 与顺序信息。
+    ``packet`` 为 None 时，原始帧仍可由 ``source_frame_id`` 在会话记录中查回。
+    """
+    if not isinstance(frame_event, dict):
+        raise TypeError("frame_event must be an object")
+    if (
+        frame_event.get("event_type") != "raw_network_event"
+        or frame_event.get("stream_type") != "websocket"
+        or frame_event.get("kind") != "frame"
+    ):
+        raise ValueError("frame_event must describe a raw WebSocket frame")
+
+    payload = frame_event.get("payload")
+    packet = parse_socketio_frame(payload) if isinstance(payload, str) else None
+    frame_id = str(frame_event.get("event_id", ""))
+    return {
+        "event_type": "decoded_socketio_event",
+        "schema_version": 1,
+        "event_id": frame_id,
+        "source_frame_id": frame_id,
+        "connection_id": frame_event.get("connection_id", ""),
+        "stream_id": frame_event.get("stream_id", ""),
+        "stream_sequence": frame_event.get("stream_sequence", 0),
+        "ingest_sequence": frame_event.get("ingest_sequence", 0),
+        "direction": frame_event.get("direction", ""),
+        "observed_at": frame_event.get("observed_at", ""),
+        "decode_status": "decoded" if packet is not None else "no_packet",
+        "packet": packet,
+    }

@@ -1,7 +1,7 @@
 """统一的对局数据获取接口。
 
-数据来源（HTTP、旧版 WebSocket 聚合器、后续的 Profile 映射器）都应输出
-GameDataSnapshot。上层 Agent 只消费 snapshot.state，不再依赖具体采集方式。
+数据来源（HTTP API 或 WebSocket 桥接器）都输出 GameDataSnapshot。
+上层决策代码只消费 snapshot.state，不依赖具体采集方式。
 """
 
 from __future__ import annotations
@@ -20,8 +20,7 @@ class GameDataSnapshot:
     state: GameState
     raw: dict[str, Any] = field(default_factory=dict)
     source_events: list[dict[str, Any]] = field(default_factory=list)
-    mapping_version: str = "unknown"
-    confidence: float = 1.0
+    provider_version: str = "unknown"
     unresolved_fields: list[str] = field(default_factory=list)
     source_kind: str = "unknown"
     actions_already_observed: bool = False
@@ -31,7 +30,7 @@ class GameDataSnapshot:
 
     @property
     def is_valid(self) -> bool:
-        """基础结构有效；具体站点规则由 ProfileProvider 继续校验。"""
+        """基础结构有效，且数据适配器没有报告未解析字段。"""
         return isinstance(self.state, GameState) and not self.unresolved_fields
 
 
@@ -52,7 +51,7 @@ class GameDataProvider(Protocol):
 class HttpGameDataProvider:
     """将一次 HTTP 状态 JSON 适配为统一快照。"""
 
-    mapping_version = "http-field-map-v1"
+    provider_version = "http-field-map-v1"
 
     def __init__(self, parser):
         self.parser = parser
@@ -64,8 +63,7 @@ class HttpGameDataProvider:
             state=state,
             raw=event,
             source_events=[event],
-            mapping_version=self.mapping_version,
-            confidence=1.0,
+            provider_version=self.provider_version,
             source_kind="http",
         )
         return [self._snapshot]

@@ -1,4 +1,4 @@
-"""学习模式的全局反引号键监听器。"""
+"""数据采集模式的全局反引号键监听器。"""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class BoundaryListener:
             from pynput import keyboard
         except ImportError:
             if self.verbose:
-                print("[Learn] 未安装 pynput，无法监听反引号键；可使用 pynput>=1.7")
+                print("[Capture] 未安装 pynput，无法监听反引号键；可使用 pynput>=1.7")
             return False
 
         try:
@@ -57,7 +57,7 @@ class BoundaryListener:
         except Exception as exc:
             # 无桌面环境或 macOS 辅助功能权限不足时，不能影响浏览器采集。
             if self.verbose:
-                print(f"[Learn] 反引号监听不可用: {exc}")
+                print(f"[Capture] 反引号监听不可用: {exc}")
             self._listener = None
             return False
 

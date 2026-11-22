@@ -1,18 +1,32 @@
-"""德州扑克 AI Bridge — CDP WebSocket 桥接器。
+"""德州扑克 AI Bridge — Socket.IO 网络采集、解析与决策路由。"""
 
-从浏览器拦截 socket.io 游戏数据，转发给 AI Agent 决策引擎。
-"""
+from core.data_provider import GameDataProvider, GameDataSnapshot, HttpGameDataProvider
 
-from .protocol import parse_socketio_frame
 from .aggregator import GamePhase, GameStateAggregator
-from .data_provider import LegacyWebSocketDataProvider, ProfileGameDataProvider
-from .interceptor import WebSocketInterceptor
 from .browser import (
-    try_connect_existing,
-    launch_new,
-    recover_state,
     CDP_PORT,
     DEFAULT_GAME_URL,
+    launch_new,
+    recover_state,
+    try_connect_existing,
 )
+from .data_provider import SocketIOGameDataProvider
 from .hand_segments import HandBoundary, HandSegment, HandSegmenter, SegmentEventRef
-from .learning_queue import LearningJob, LearningJobQueue
+from .interceptor import WebSocketInterceptor
+from .learning_input import LearningInputSource, LearningPromptInput, build_learning_input
+from .network_context import NetworkContext, NetworkEventContext
+from .protocol import decode_socketio_frame_event, parse_socketio_frame
+from .replay import replay_socketio_events, replay_socketio_session
+from .session_recorder import SessionRecorder
+
+__all__ = [
+    "GameDataProvider", "GameDataSnapshot", "HttpGameDataProvider",
+    "GamePhase", "GameStateAggregator", "SocketIOGameDataProvider",
+    "WebSocketInterceptor", "try_connect_existing", "launch_new",
+    "LearningInputSource", "LearningPromptInput", "build_learning_input",
+    "recover_state", "CDP_PORT", "DEFAULT_GAME_URL",
+    "HandBoundary", "HandSegment", "HandSegmenter", "SegmentEventRef",
+    "NetworkContext", "NetworkEventContext", "SessionRecorder",
+    "parse_socketio_frame", "decode_socketio_frame_event",
+    "replay_socketio_events", "replay_socketio_session",
+]

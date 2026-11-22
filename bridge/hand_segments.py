@@ -1,4 +1,4 @@
-"""按人工边界切分学习数据，并以引用方式复用 overlap 事件。"""
+"""按人工边界切分采集数据，并以引用方式复用 overlap 事件。"""
 
 from __future__ import annotations
 
@@ -252,5 +252,5 @@ class HandSegmenter:
             try:
                 callback(value)
             except Exception:
-                # 分段和采集不能因学习回调异常而中断。
+                # 分段和采集不能因回调异常而中断。
                 continue

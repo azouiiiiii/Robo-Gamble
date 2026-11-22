@@ -1,179 +1,117 @@
 # Robo Gamble AI Agent
 
-![cover](cover.jpg)
+基于 LLM 的德州扑克决策引擎。游戏数据可以通过 HTTP API 输入，也可以由 Playwright Bridge 从浏览器的 Socket.IO WebSocket 中采集。
 
-基于 LLM 的德州扑克 AI 决策引擎，通过 WebSocket 拦截或 HTTP API 获取游戏状态，三层并行架构进行对手建模与决策。
+## 数据链路
 
----
+### 当前 Bridge
 
-## 架构
+```text
+WebSocket 帧
+  → Socket.IO 协议解码
+  → 现有站点聚合器
+  → GameDataSnapshot / GameState
+  → 决策层
 
-```
-                    ┌──────────────────────────┐
-                    │       Game Platform       │
-                    │  (TexasPokerGame-master)  │
-                    └─────┬──────────┬─────────┘
-                          │          │
-              WebSocket 帧 │          │ HTTP API
-                          ▼          ▼
-                    ┌──────────┐  ┌──────────┐
-                    │ bridge.py│  │ main.py  │
-                    │ (CDP拦截) │  │ (HTTP服务)│
-                    └────┬─────┘  └────┬─────┘
-                         │             │
-                         └──────┬──────┘
-                                ▼
-              ┌─────────────────────────────────┐
-              │     MultiOpponentMemory         │
-              │                                  │
-              │  L1: Profile Workers (×3)        │
-              │  L2: Hand Reader Workers (×3)    │
-              │  L3: Decision Agent  (×1)        │
-              └─────────────────────────────────┘
+聚合器产生的对手动作增量 ──→ /observe ──→ 对手记忆
+结算信息             ──→ /observe ──→ 对手记忆
 ```
 
-### 三层并行流水线
+当前站点聚合器仍按 Pokernow 的 Socket.IO 事件格式维护牌局状态。它是现有可运行实现，尚未拆成平台专属单事件解释器与独立状态聚合器。
 
-| 层 | 工作线程 | 触发时机 | 职责 |
-|---|---------|---------|------|
-| L1 | Profile Workers ×3 | 对手每次动作 + 手牌结束 | 综合开枪频率/松紧度/侵略性更新对手画像 |
-| L2 | Hand Reader Workers ×3 | 对手每次动作 | 结合画像缓存推断对手当前手牌范围 |
-| L3 | Decision Agent ×1 | 己方回合 | 等 L1+L2 完成后整合 prompt，开 thinking 决策 |
+### 目标数据链路
 
-L1 和 L2 并行消费对手队列。每批事件有双标签（`profile_written` + `hand_read`），两者都为 True 时移出缓冲区。
+```text
+原始 Socket.IO 帧
+  → 平台专属解释器（直接读取原始帧，提取单帧牌局事实 / 状态补丁）
+      ├─→ 状态聚合器（累计为当前 GameState，供决策层读取）
+      └─→ 记忆层（消费对手动作、摊牌和结算等增量事件）
+```
 
-### 多对手建模
+Learning prompt 只输入原始 WebSocket 帧，不接入通用 Socket.IO 解码器，也不输入 HTTP 事件。`learning_input.yaml` 定义帧筛选、顺序、prompt 字段和来源回查规则；人工采集分段只限定样本范围，不作为牌局边界标签。解释器只说明当前帧表达了什么，不持有整局累计状态。状态聚合器负责把单条事实应用到当前状态；记忆层按增量消费动作与结算信息。平台专属解释器的学习、验证和运行时尚待实现。
 
-每个对手拥有独立的缓冲队列和画像缓存。`/observe` 端点按 `opp_id` 路由到对应队列，L1/L2 workers 并行处理。L2 直接读 L1 缓存画像做个性化读牌，不等 L1 当次任务完成。手牌结束时 L2 预测与摊牌实际对比反馈给 L1 校准。
+## 对手建模与决策
 
----
+| 层 | 触发时机 | 职责 |
+|---|---|---|
+| L1 对手画像 | 对手动作与手牌结束 | 更新开枪频率、松紧度和侵略性等统计 |
+| L2 读牌 | 对手动作 | 结合画像推断对手当前手牌范围 |
+| L3 决策 | 己方回合 | 汇总当前 GameState 与 L1/L2 结果，生成动作 |
 
-## 部署方式
+L1 和 L2 并行消费对手动作。每个对手拥有独立的缓冲队列和画像缓存；结算时会把摊牌信息交给记忆层校准。
 
-### 方式 1：HTTP API 模式
+## Bridge 模式
 
 ```bash
-python main.py  # 启动 AI 引擎，监听 :8765
+python bridge.py --mode learn --url http://localhost:7001
+python bridge.py --mode verify --url http://localhost:7001
+python bridge.py --mode auto --url http://localhost:7001
 ```
 
-外部平台通过 `POST /decide` 推送游戏状态，引擎返回决策 JSON。字段名通过 `config.json` 的 `field_map` 映射。
+- `learn`：保存 WebSocket 原始帧和可选的 HTTP 网络事件；反引号键 `` ` `` / ``~`` 可标记牌局边界，并按 overlap 窗口生成分段引用。此模式只采集，不调用学习 Agent。
+- `verify`：用当前内置 Socket.IO 聚合器解析事件，在页面浮层显示当前状态，不调用决策 Agent。
+- `auto`：用同一聚合器生成决策状态，将对手动作和结算信息发送给 `/observe`，并自动执行决策。
 
-### 方式 2：CDP WebSocket 桥接模式
+采集配置位于 `config.json` 的 `bridge.capture`：`session_dir`、`boundary_key` 和 `overlap_ms`。原始网络事件以 JSONL 写入 `learning_sessions/`，WebSocket 帧与网络事件带有事件 ID 和流内序号。`bridge.replay.replay_socketio_session(path, hand_id=...)` 可用同一解码入口重放整份会话或指定分段。
+
+Learning 输入契约位于 `learning_input.yaml`：学习 prompt 直接使用原始 WebSocket 帧；HTTP 仍可留在采集会话中，但不会进入该输入。当前 `verify` / `auto` 使用的 Socket.IO 解码和聚合路径与新 Learning 输入链路分开。
+
+离线生成 prompt 输入时调用 `bridge.learning_input.build_learning_input(session_path, capture_segment_id=...)`。返回对象的 `prompt_text` 可交给 Learning Agent，`source_map` 在 prompt 外保留每行对应的原始事件 ID。
+
+页面 HTTP 采集配置位于 `bridge.network_capture`。learn 模式会记录请求事件以保留请求与响应之间的关联；敏感请求头按配置脱敏。
+
+## HTTP API 模式
 
 ```bash
-python bridge.py --auto --url http://localhost:7001
+python main.py
 ```
 
-通过 Playwright CDP 拦截浏览器网络数据，提取游戏状态、上报对手动作并按模式执行后续流程。旧版兼容参数支持两种行为：
-
-- `--auto`：自动执行决策
-- 不加 `--auto`：仅页面浮层显示建议
-
-Bridge 现在也支持三种显式运行模式：
-
-```bash
-python bridge.py --mode learn    # 只采集原始网络流，保存到 learning_sessions/
-python bridge.py --mode verify   # 固定 Profile 解析，并在页面浮层显示结果
-python bridge.py --mode auto     # 固定 verified/builtin Profile，运行 L1/L2/L3 并自动执行
-```
-
-学习模式按键盘左上角的反引号键 `` ` `` / ``~`` 手动标记牌局边界。边界后的
-`learning.overlap_ms` 时间窗口会以引用方式同时归入上一局尾部和下一局头部，
-学习任务进入后台队列，采集不会等待学习分析完成。队列参数位于 `learning`：
-`boundary_key`、`overlap_ms`、`job_queue_size`、`worker_count`。
-
-启用 `learning.auto_learn` 后，每个已完成分段会调用 LearningAgent，保存或增量更新
-`profiles/learned_<host>.json`。同一局的任务状态、Profile 路径与置信度会写回对应
-`learning_sessions/*.jsonl` 的 `learning_result` 记录；请求超时由
-`learning.request_timeout_seconds` 控制。
-
-`--auto` 仍然兼容，等同于 `--mode auto`。模式也可通过 `config.json` 的
-`bridge.mode` 配置；`bridge.mapping_profile` 指定使用的 Profile。
-
----
+外部平台通过 `POST /decide` 提交游戏状态。字段名由 `config.json` 中的 `platform.field_map` 配置。`POST /observe` 接收对手动作、结算信息和网络上下文。
 
 ## 策略引擎
 
 `strategy.yaml` 将扑克策略编码为两层：
 
-- **硬约束**：不可违反的 guardrail（`to_call=0` 禁止 fold、强牌分数门槛等）
-- **战术引导**：软建议（底池控制、价值尺度、翻牌/转牌策略、诈唬条件）
+- **硬约束**：不可违反的 guardrail，例如 `to_call=0` 时禁止 fold。
+- **战术引导**：底池控制、价值尺度、翻牌/转牌策略和诈唬条件。
 
-### 翻前 GTO 混合策略
-
-基于位置 + 手牌分数的随机化入池决策，避免打法被对手摸透：
+翻前策略按位置与手牌分数随机化边缘动作：
 
 | 位置 | 强牌线 | 垃圾线 | Fold% | Call% | Raise% |
-|------|--------|--------|-------|-------|--------|
-| 前位(UTG) | ≥7 | ≤3 | 55 | 35 | 10 |
-| 中位(MP) | ≥6 | ≤2 | 40 | 40 | 20 |
-| 关煞(CO) | ≥5 | ≤1 | 25 | 45 | 30 |
-| 庄位(BTN) | ≥4 | ≤0 | 15 | 45 | 40 |
-| 小盲(SB) | ≥6 | ≤2 | 40 | 30 | 30 |
-| 大盲(BB) | ≥4 | ≤0 | 25 | 50 | 25 |
-
-边缘手牌按权重随机分配动作，强牌不受干预、垃圾牌强制弃牌。
-
----
+|---|---:|---:|---:|---:|---:|
+| 前位 (UTG) | ≥7 | ≤3 | 55 | 35 | 10 |
+| 中位 (MP) | ≥6 | ≤2 | 40 | 40 | 20 |
+| 关煞 (CO) | ≥5 | ≤1 | 25 | 45 | 30 |
+| 庄位 (BTN) | ≥4 | ≤0 | 15 | 45 | 40 |
+| 小盲 (SB) | ≥6 | ≤2 | 40 | 30 | 30 |
+| 大盲 (BB) | ≥4 | ≤0 | 25 | 50 | 25 |
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
-
-# 配置
 cp config.example.json config.json
-# 编辑 config.json，填入 AI API key
-
-# 先启动 AI 引擎
+# 在 config.json 中填写 AI API key
 python main.py
-
-# 再启动桥接器（连接游戏浏览器）
-python bridge.py --auto --url http://localhost:7001
+python bridge.py --mode auto --url http://localhost:7001
 ```
 
----
+Bridge 依赖 Playwright：`pip install playwright && playwright install chromium`。
 
-## 目录结构
+## 主要目录
 
+```text
+main.py                   HTTP 决策服务入口
+bridge.py                 CDP WebSocket Bridge 入口
+core/                     GameState 与 HTTP 输入适配器
+bridge/protocol.py        Socket.IO 帧解码
+bridge/replay.py          原始会话到结构化 Socket.IO 事件的回放
+bridge/aggregator.py      当前 Pokernow 事件聚合器
+bridge/data_provider.py   Socket.IO 聚合器到 GameDataSnapshot 的适配
+bridge/interceptor.py     WebSocket 拦截、采集和决策路由
+bridge/session_recorder.py 原始网络事件持久化
+bridge/hand_segments.py  人工边界与 overlap 分段
+learning_input.yaml      Learning Agent 的原始 WebSocket 输入契约
+bridge/learning_input.py 按契约筛选会话并渲染原始帧 prompt
+server/                   对手记忆、读牌与决策
 ```
-texas/
-├── main.py                  # HTTP API 模式入口
-├── bridge.py                # CDP WebSocket 桥接器入口
-├── config.json              # 运行配置
-├── strategy.yaml            # 扑克策略 DSL
-├── requirements.txt
-│
-├── server/                  # AI 决策核心
-│   ├── decision.py          # DecisionAgent LLM 调用
-│   ├── evaluator.py         # 确定性计算（手牌评估/赔率/outs）
-│   ├── prompt.py            # Prompt 构建 + YAML 规则引擎
-│   ├── memory.py            # 旧单对手记忆（已弃用）
-│   └── multi_memory.py      # 多对手记忆系统（三层并行）
-│
-├── core/                    # 数据模型
-│   ├── gamestate.py         # GameState / OpponentAction / GamePhase
-│   └── adapter.py           # 平台适配器（HTTP 服务器 + field_map）
-│
-├── bridge/                  # CDP WebSocket 桥接器
-│   ├── protocol.py          # Socket.IO 线协议解析
-│   ├── aggregator.py        # 事件流 → GameState 聚合
-│   ├── interceptor.py       # Playwright CDP 拦截 + 决策路由
-│   ├── hand_segments.py     # 人工边界、overlap 引用分段
-│   ├── learning_queue.py    # 异步学习任务队列
-│   ├── boundary_listener.py # 反引号全局键监听
-│   └── browser.py           # 浏览器生命周期管理
-│
-└── utils/
-    ├── config_manager.py    # JSON 配置加载
-    └── logger.py            # 日志
-```
-
----
-
-## 设计原则
-
-- **LLM 做策略推理 + 确定性代码做数学计算**：赔率、outs、成牌判定由 `evaluator.py` 精确计算，LLM 不做数学
-- **三层并行解耦**：画像更新、读牌、决策互不阻塞，超时缓存兜底
-- **硬约束优先**：`strategy.yaml` 的 guardrail 不可违反，LLM 在边界内自由发挥
-- **平台无关**：换平台只改 `config.json` 的 `field_map`，不改代码

@@ -3,7 +3,7 @@
 from playwright.async_api import async_playwright, Page
 
 from .interceptor import WebSocketInterceptor
-from .data_provider import ProfileGameDataProvider
+from .data_provider import SocketIOGameDataProvider
 
 
 _INIT_SCRIPT = """
@@ -20,12 +20,9 @@ DEFAULT_GAME_URL = "http://localhost:8080"
 
 async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int,
                                verbose: bool = False, network_config: dict | None = None,
-                               profile_id: str = "legacy_socketio_v1",
-                               profile_dir: str = "profiles",
                                mode: str = "verify",
-                               learning_session_dir: str = "learning_sessions",
-                               learning_config: dict | None = None,
-                               learning_handler=None) -> tuple | None:
+                               session_dir: str = "learning_sessions",
+                               capture_config: dict | None = None) -> tuple | None:
     """尝试连接已有 Chrome，失败返回 None"""
     try:
         pw = await async_playwright().start()
@@ -46,9 +43,7 @@ async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int,
 
         interceptor = WebSocketInterceptor(
             agent_url, verbose=verbose, network_config=network_config,
-            profile_id=profile_id, profile_dir=profile_dir, mode=mode,
-            learning_session_dir=learning_session_dir,
-            learning_config=learning_config, learning_handler=learning_handler,
+            mode=mode, session_dir=session_dir, capture_config=capture_config,
         )
         await interceptor.attach(page, auto_mode=auto_mode)
         await page.evaluate(_INIT_SCRIPT)
@@ -66,18 +61,13 @@ async def try_connect_existing(agent_url: str, auto_mode: bool, cdp_port: int,
 
 async def launch_new(game_url: str, agent_url: str, auto_mode: bool, cdp_port: int,
                      verbose: bool = False, network_config: dict | None = None,
-                     profile_id: str = "legacy_socketio_v1",
-                     profile_dir: str = "profiles",
                      mode: str = "verify",
-                     learning_session_dir: str = "learning_sessions",
-                     learning_config: dict | None = None,
-                     learning_handler=None) -> tuple:
+                     session_dir: str = "learning_sessions",
+                     capture_config: dict | None = None) -> tuple:
     """拉起新 Chrome，同时打开 CDP 端口供后续连接"""
     interceptor = WebSocketInterceptor(
         agent_url, verbose=verbose, network_config=network_config,
-        profile_id=profile_id, profile_dir=profile_dir, mode=mode,
-        learning_session_dir=learning_session_dir,
-        learning_config=learning_config, learning_handler=learning_handler,
+        mode=mode, session_dir=session_dir, capture_config=capture_config,
     )
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
@@ -128,11 +118,8 @@ async def recover_state(page: Page, interceptor: WebSocketInterceptor):
             print(f"[Bridge] 从页面恢复玩家: {result.get('nickName')} (userId={result['userId']})")
             if interceptor.mode.value == "learn":
                 return
-            interceptor.data_provider = ProfileGameDataProvider.from_registry(
-                interceptor.profile_id,
-                result["userId"],
-                verbose=interceptor.verbose,
-                profile_dir=interceptor.profile_dir,
+            interceptor.data_provider = SocketIOGameDataProvider(
+                result["userId"], verbose=interceptor.verbose
             )
     except Exception:
         pass

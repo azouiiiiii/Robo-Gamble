@@ -1,12 +1,10 @@
-"""Playwright 页面级网络采集与站点档案支持。"""
+"""Playwright 页面级网络采集。"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
@@ -69,6 +67,7 @@ class PageNetworkCollector:
         on_event: Optional[Callable[[dict], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
         send_enabled: bool = True,
+        sequencer: NetworkEventSequencer | None = None,
     ):
         self.agent_url = agent_url.rstrip("/")
         self.cfg = config or {}
@@ -79,7 +78,7 @@ class PageNetworkCollector:
         self._queue: Optional[asyncio.Queue] = None
         self._sender_task: Optional[asyncio.Task] = None
         self._closed = False
-        self._sequencer = NetworkEventSequencer()
+        self._sequencer = sequencer or NetworkEventSequencer()
         self._request_events: dict[str, dict] = {}
         self.dropped = 0
 
@@ -273,33 +272,3 @@ class PageNetworkCollector:
             self._sender_task = None
 
 
-class SiteProfileStore:
-    """保存每个站点的简化字段和事件映射。"""
-
-    def __init__(self, directory: str = "profiles"):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-
-    def _path(self, host: str) -> Path:
-        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", host.lower()) or "unknown"
-        return self.directory / f"{safe}.json"
-
-    def load(self, host: str) -> dict:
-        path = self._path(host)
-        if not path.exists():
-            return {}
-        try:
-            with path.open("r", encoding="utf-8") as file:
-                return json.load(file)
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    def save(self, host: str, profile: dict):
-        payload = dict(profile)
-        payload["host"] = host
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-        path = self._path(host)
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
-        temporary.replace(path)

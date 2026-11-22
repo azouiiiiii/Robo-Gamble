@@ -1,0 +1,68 @@
+# Learning Agent 的原始 Socket.IO 学习输入契约。
+# 采集分段仅用于选择一段记录，不代表牌局语义标签或准确手牌边界。
+contract:
+  name: raw_socketio_learning_input
+  version: 1
+
+source:
+  format: session_jsonl
+  event_envelope_key: event
+  segment_record_type: hand_segment
+  capture_segment_id_field: hand_id
+  segment_event_refs_key: events
+  segment_event_ref_key: event_id
+  segment_semantics: capture_slice_only
+  expose_segment_id_to_model: false
+
+selection:
+  event_type: raw_network_event
+  stream_type: websocket
+  kind: frame
+  directions:
+    - RECV
+    - SENT
+  include_http: false
+  include_all_matching_segment_refs: true
+
+payload:
+  field: payload
+  required_type: string
+  use_as_recorded: true
+  decode_socketio: false
+  normalize_or_rewrite: false
+  include_control_frames: true
+  line_break_policy: reject_with_source_id
+
+ordering:
+  prompt_line_order: ingest_sequence
+  within_stream_order: stream_sequence
+  cross_stream_order_means: observed_order_only
+
+prompt:
+  format: one_frame_per_line
+  fields:
+    - stream_sequence
+    - direction
+    - payload
+  connection_alias:
+    include_when_multiple_connections: true
+    assign_by: first_observed_order
+  line_format: "{stream_sequence}\t{direction}\t{payload}"
+  multi_connection_line_format: "{connection_alias}\t{stream_sequence}\t{direction}\t{payload}"
+  payload_is_remainder_of_line: true
+  include_event_id: false
+  include_timestamps: false
+  include_http_metadata: false
+  include_decoded_packets: false
+  preserve_payload_text_verbatim: true
+
+provenance:
+  source_event_id_field: event_id
+  keep_source_lookup_outside_prompt: true
+  prompt_line_index_to_event_id_map: true
+
+semantic_labeling:
+  infer_hand_boundaries_from_frames: true
+  prelabel_hand_starts_or_ends: false
+  trim_capture_segment_by_inferred_hand: false
+  infer_event_and_field_meanings: true
